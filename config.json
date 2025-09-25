@@ -1,0 +1,17 @@
+{
+  "projects": ["your-project-id-1", "your-project-id-2"],
+  "max_workers": 5,
+  "max_memory_mb": 8192,
+  "rows_per_batch": 10000,
+  "checkpoint_enabled": true,
+  "retry_attempts": 3,
+  "retry_delay_seconds": 5,
+  "sampling_percent_for_large_tables": 10,
+  "large_table_threshold_rows": 1000000,
+  "log_level": "INFO",
+  "export_formats": ["duckdb", "csv"],
+  "column_limit": 100,
+  "max_raw_forms_per_host": 20,
+  "max_occurrences_per_host": 100,
+  "max_values_per_column": 50
+}

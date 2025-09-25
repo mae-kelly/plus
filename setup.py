@@ -25,26 +25,61 @@ def check_mac_silicon():
     except:
         return 'arm64' in platform.machine().lower()
 
+def check_pytorch_mps():
+    """Check if PyTorch is installed with MPS support"""
+    try:
+        import torch
+        
+        print(f"  PyTorch version: {torch.__version__}")
+        
+        if not torch.backends.mps.is_available():
+            print("  WARNING: MPS not available")
+            return False
+            
+        if not torch.backends.mps.is_built():
+            print("  WARNING: PyTorch not built with MPS support")
+            return False
+            
+        # Test MPS
+        try:
+            device = torch.device('mps')
+            x = torch.randn(5, 5, device=device)
+            y = x @ x.T
+            print("  MPS test: OK")
+            return True
+        except Exception as e:
+            print(f"  MPS test failed: {e}")
+            return False
+            
+    except ImportError:
+        print("  PyTorch not installed")
+        return False
+
 def check_dependencies():
     """Check if all required packages are installed"""
     required_packages = [
-        'google-cloud-bigquery',
-        'torch',
-        'duckdb',
-        'numpy',
-        'scipy',
-        'sklearn',
-        'tqdm'
+        ('google.cloud.bigquery', 'google-cloud-bigquery'),
+        ('torch', 'torch'),
+        ('duckdb', 'duckdb'),
+        ('numpy', 'numpy'),
+        ('scipy', 'scipy'),
+        ('sklearn', 'scikit-learn'),
+        ('tqdm', 'tqdm')
     ]
     
     missing = []
-    for package in required_packages:
+    installed = []
+    
+    for import_name, package_name in required_packages:
         try:
-            __import__(package.replace('-', '_'))
+            module = __import__(import_name.split('.')[0])
+            # Get version if available
+            version = getattr(module, '__version__', 'unknown')
+            installed.append(f"{package_name} ({version})")
         except ImportError:
-            missing.append(package)
+            missing.append(package_name)
             
-    return missing
+    return missing, installed
 
 def check_gcp_credentials():
     """Check if GCP credentials file exists"""
@@ -118,6 +153,21 @@ def check_config():
         
     return True
 
+def print_installation_instructions():
+    """Print instructions for installing dependencies"""
+    print("\n" + "="*60)
+    print("Installation Instructions for Mac M1/M2/M3:")
+    print("="*60)
+    print("\nOption 1: Run the install script")
+    print("  chmod +x install.sh")
+    print("  ./install.sh")
+    print("\nOption 2: Manual installation")
+    print("  # Install PyTorch for Apple Silicon:")
+    print("  pip3 install torch torchvision torchaudio")
+    print("\n  # Install other dependencies:")
+    print("  pip3 install google-cloud-bigquery duckdb numpy scipy scikit-learn tqdm")
+    print("\n" + "="*60)
+
 def main():
     print("CMDB+ Environment Check")
     print("="*50)
@@ -140,35 +190,23 @@ def main():
     print(f"OK ({sys.version.split()[0]})")
     
     # Check dependencies
-    print("Checking dependencies...", end=" ")
-    missing = check_dependencies()
+    print("\nChecking dependencies:")
+    missing, installed = check_dependencies()
+    
+    if installed:
+        print("  Installed packages:")
+        for package in installed:
+            print(f"    ✓ {package}")
+    
     if missing:
-        print("FAILED")
-        print(f"\nMissing packages: {', '.join(missing)}")
-        print("\nInstall with:")
-        print(f"  pip install -r requirements.txt")
+        print("  Missing packages:")
+        for package in missing:
+            print(f"    ✗ {package}")
+        print_installation_instructions()
         sys.exit(1)
-    print("OK")
     
-    # Check GCP credentials
-    print("Checking GCP credentials...", end=" ")
-    if not check_gcp_credentials():
-        sys.exit(1)
-    print("OK")
-    
-    # Check config
-    print("Checking configuration...", end=" ")
-    if not check_config():
-        sys.exit(1)
-    print("OK")
-    
-    print("\n" + "="*50)
-    print("All checks passed! You can now run:")
-    print("  python main.py")
-    
-    # Create necessary directories
-    Path('logs').mkdir(exist_ok=True)
-    print("\nCreated logs directory")
-
-if __name__ == "__main__":
-    main()
+    # Check PyTorch MPS
+    print("\nChecking PyTorch MPS support:")
+    if not check_pytorch_mps():
+        print("\nWARNING: PyTorch MPS support not available")
+        print("The system requires GPU acceleration")

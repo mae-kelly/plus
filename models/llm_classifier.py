@@ -1,356 +1,168 @@
 import json
 from typing import List, Dict, Any
+from snorkel.labeling import LabelingFunction, PandasLFApplier
+from snorkel.labeling.model import LabelModel
 import numpy as np
 import pandas as pd
 import logging
 import re
-from collections import Counter
 
 logger = logging.getLogger(__name__)
 
 class RuleBasedClassifier:
-    """Rule-based classifier without external LLM dependencies"""
-    
-    def __init__(self, config: Dict):
-        self.config = config
-        self.rules = self._initialize_rules()
-        self.pattern_cache = {}
+    """Rule-based classifier to replace LLM"""
+    def __init__(self):
+        self.patterns = self._initialize_patterns()
         
-    def _initialize_rules(self) -> Dict[str, List[Dict]]:
-        """Initialize classification rules"""
+    def _initialize_patterns(self):
+        """Initialize classification patterns"""
         return {
             'hostname': [
-                {'pattern': r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?$', 'weight': 0.8},
-                {'pattern': r'^[a-z]+-[a-z]+-\d+$', 'weight': 0.7},
-                {'pattern': r'(server|host|node|machine)', 'weight': 0.6, 'type': 'contains'},
-                {'column_name': ['host', 'hostname', 'server', 'machine'], 'weight': 0.9}
+                (r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?$', 0.9),
+                (r'server|host|node|machine', 0.7),
             ],
             'ip_address': [
-                {'pattern': r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', 'weight': 0.95},
-                {'pattern': r'^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$', 'weight': 0.95},
-                {'column_name': ['ip', 'ipaddr', 'ip_address', 'address'], 'weight': 0.8}
+                (r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', 0.95),
+                (r'^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$', 0.95),
             ],
             'email': [
-                {'pattern': r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', 'weight': 0.95},
-                {'column_name': ['email', 'mail', 'email_address'], 'weight': 0.9}
+                (r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', 0.95),
             ],
             'timestamp': [
-                {'pattern': r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', 'weight': 0.9},
-                {'pattern': r'^\d{10,13}$', 'weight': 0.7},  # Unix timestamp
-                {'column_name': ['timestamp', 'created', 'modified', 'updated', 'datetime'], 'weight': 0.85}
-            ],
-            'date': [
-                {'pattern': r'^\d{4}-\d{2}-\d{2}$', 'weight': 0.9},
-                {'pattern': r'^\d{1,2}/\d{1,2}/\d{4}$', 'weight': 0.85},
-                {'column_name': ['date', 'day', 'birth_date', 'start_date', 'end_date'], 'weight': 0.8}
-            ],
-            'phone': [
-                {'pattern': r'^(\+\d{1,3})?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}$', 'weight': 0.9},
-                {'column_name': ['phone', 'telephone', 'mobile', 'cell'], 'weight': 0.85}
-            ],
-            'url': [
-                {'pattern': r'^https?://[^\s]+$', 'weight': 0.95},
-                {'pattern': r'^www\.[^\s]+$', 'weight': 0.8},
-                {'column_name': ['url', 'link', 'website', 'uri'], 'weight': 0.85}
-            ],
-            'uuid': [
-                {'pattern': r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', 'weight': 0.95},
-                {'column_name': ['uuid', 'guid', 'id'], 'weight': 0.7}
+                (r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', 0.9),
+                (r'^\d{10,13}$', 0.7),
             ],
             'numeric_id': [
-                {'pattern': r'^\d+$', 'weight': 0.6},
-                {'column_name': ['id', 'identifier', 'key', 'number'], 'weight': 0.7},
-                {'check': 'all_numeric', 'weight': 0.8}
+                (r'^\d+$', 0.8),
             ],
-            'amount': [
-                {'pattern': r'^\$?\d+\.?\d*$', 'weight': 0.8},
-                {'column_name': ['amount', 'price', 'cost', 'value', 'total', 'balance'], 'weight': 0.9},
-                {'check': 'numeric_with_decimals', 'weight': 0.7}
+            'url': [
+                (r'^https?://[^\s]+$', 0.95),
             ],
-            'percentage': [
-                {'pattern': r'^\d+\.?\d*%?$', 'weight': 0.8},
-                {'column_name': ['percentage', 'percent', 'rate', 'ratio'], 'weight': 0.85},
-                {'check': 'range_0_100', 'weight': 0.7}
-            ],
-            'boolean': [
-                {'values': ['true', 'false', '0', '1', 'yes', 'no', 't', 'f', 'y', 'n'], 'weight': 0.9},
-                {'column_name': ['flag', 'is_', 'has_', 'enabled', 'active'], 'weight': 0.8}
-            ],
-            'environment': [
-                {'values': ['prod', 'production', 'staging', 'dev', 'development', 'test', 'qa'], 'weight': 0.9},
-                {'column_name': ['env', 'environment', 'stage'], 'weight': 0.85}
+            'phone': [
+                (r'^(\+\d{1,3})?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}$', 0.9),
             ]
         }
     
-    async def classify_with_rules(self, column_name: str, values: List[Any]) -> Dict[str, Any]:
-        """Classify column using rule-based system"""
-        
+    def classify(self, column_name: str, values: List[Any]) -> Dict[str, Any]:
+        """Classify column based on patterns"""
         scores = {}
         
         # Clean values
-        str_values = [str(v).strip().lower() if v is not None else '' for v in values[:100]]
-        non_empty_values = [v for v in str_values if v]
+        str_values = [str(v).strip() for v in values[:100] if v is not None]
         
-        if not non_empty_values:
-            return {'type': 'unknown', 'confidence': 0.0, 'reasoning': 'No values to analyze'}
+        if not str_values:
+            return {'type': 'unknown', 'confidence': 0.0}
         
-        # Check each type's rules
-        for data_type, rules in self.rules.items():
-            type_score = 0.0
-            matches = 0
+        # Check each pattern
+        for data_type, patterns in self.patterns.items():
+            type_score = 0
+            for pattern, weight in patterns:
+                matches = sum(1 for v in str_values if re.match(pattern, v, re.I))
+                match_ratio = matches / len(str_values)
+                type_score = max(type_score, match_ratio * weight)
             
-            for rule in rules:
-                if 'pattern' in rule:
-                    pattern_matches = self._check_pattern(non_empty_values, rule['pattern'], 
-                                                         rule.get('type', 'match'))
-                    if pattern_matches > 0:
-                        type_score += pattern_matches * rule['weight']
-                        matches += 1
-                
-                elif 'column_name' in rule:
-                    if self._check_column_name(column_name, rule['column_name']):
-                        type_score += rule['weight']
-                        matches += 1
-                
-                elif 'values' in rule:
-                    value_matches = self._check_values(non_empty_values, rule['values'])
-                    if value_matches > 0:
-                        type_score += value_matches * rule['weight']
-                        matches += 1
-                
-                elif 'check' in rule:
-                    check_result = self._perform_check(non_empty_values, rule['check'])
-                    if check_result:
-                        type_score += check_result * rule['weight']
-                        matches += 1
-            
-            if matches > 0:
-                scores[data_type] = type_score / matches
+            if type_score > 0:
+                scores[data_type] = type_score
+        
+        # Check column name hints
+        column_lower = column_name.lower()
+        if 'host' in column_lower or 'server' in column_lower:
+            scores['hostname'] = max(scores.get('hostname', 0), 0.7)
+        elif 'ip' in column_lower:
+            scores['ip_address'] = max(scores.get('ip_address', 0), 0.7)
+        elif 'email' in column_lower or 'mail' in column_lower:
+            scores['email'] = max(scores.get('email', 0), 0.7)
+        elif 'time' in column_lower or 'date' in column_lower:
+            scores['timestamp'] = max(scores.get('timestamp', 0), 0.6)
+        elif 'id' in column_lower or 'key' in column_lower:
+            scores['numeric_id'] = max(scores.get('numeric_id', 0), 0.5)
         
         # Get best match
         if scores:
             best_type = max(scores, key=scores.get)
-            confidence = min(scores[best_type], 1.0)
-            
             return {
                 'type': best_type,
-                'confidence': confidence,
-                'reasoning': f"Matched {best_type} patterns with {confidence:.2f} confidence",
-                'scores': scores
+                'confidence': scores[best_type],
+                'reasoning': f"Pattern matching confidence: {scores[best_type]:.2f}"
             }
         
-        # Fallback classification based on data characteristics
-        fallback_type = self._fallback_classification(non_empty_values)
-        
-        return {
-            'type': fallback_type,
-            'confidence': 0.3,
-            'reasoning': 'No strong pattern match, using fallback classification'
-        }
-    
-    def _check_pattern(self, values: List[str], pattern: str, check_type: str = 'match') -> float:
-        """Check how many values match a pattern"""
-        matches = 0
-        
-        try:
-            compiled_pattern = re.compile(pattern, re.IGNORECASE)
-            
-            for value in values:
-                if check_type == 'match':
-                    if compiled_pattern.match(value):
-                        matches += 1
-                elif check_type == 'contains':
-                    if compiled_pattern.search(value):
-                        matches += 1
-        except:
-            return 0
-        
-        return matches / len(values) if values else 0
-    
-    def _check_column_name(self, column_name: str, keywords: List[str]) -> bool:
-        """Check if column name contains any keywords"""
-        name_lower = column_name.lower()
-        
-        for keyword in keywords:
-            if keyword in name_lower:
-                return True
-        
-        return False
-    
-    def _check_values(self, values: List[str], expected_values: List[str]) -> float:
-        """Check how many values match expected values"""
-        expected_set = set(expected_values)
-        matches = sum(1 for v in values if v in expected_set)
-        
-        return matches / len(values) if values else 0
-    
-    def _perform_check(self, values: List[str], check_type: str) -> float:
-        """Perform specific data checks"""
-        
-        if check_type == 'all_numeric':
-            numeric_count = sum(1 for v in values if v.replace('.', '').replace('-', '').isdigit())
-            return numeric_count / len(values) if values else 0
-        
-        elif check_type == 'numeric_with_decimals':
-            decimal_count = sum(1 for v in values if '.' in v and 
-                              v.replace('.', '').replace('-', '').isdigit())
-            return decimal_count / len(values) if values else 0
-        
-        elif check_type == 'range_0_100':
-            in_range = 0
-            for v in values:
-                try:
-                    num = float(v.replace('%', ''))
-                    if 0 <= num <= 100:
-                        in_range += 1
-                except:
-                    pass
-            return in_range / len(values) if values else 0
-        
-        return 0
-    
-    def _fallback_classification(self, values: List[str]) -> str:
-        """Fallback classification based on data characteristics"""
-        
-        # Check if mostly numeric
-        numeric_count = sum(1 for v in values if v.replace('.', '').replace('-', '').isdigit())
-        if numeric_count / len(values) > 0.8:
-            # Check if has decimals
-            decimal_count = sum(1 for v in values if '.' in v)
-            if decimal_count / len(values) > 0.5:
-                return 'amount'
-            else:
-                return 'numeric_id'
-        
-        # Check average length
-        avg_length = np.mean([len(v) for v in values])
-        
-        if avg_length < 10:
-            return 'category'
-        elif avg_length < 50:
-            return 'text_id'
-        else:
-            return 'description'
-
-class LabelingFunctionGenerator:
-    """Generate labeling functions for weak supervision"""
-    
-    def __init__(self):
-        self.functions = []
-        
-    def generate_function(self, column_name: str, values: List[Any]) -> callable:
-        """Generate a labeling function based on column characteristics"""
-        
-        def labeling_function(series: pd.Series) -> int:
-            # Label mappings
-            labels = {
-                'hostname': 0,
-                'ip_address': 1,
-                'email': 2,
-                'timestamp': 3,
-                'numeric_id': 4,
-                'unknown': -1
-            }
-            
-            # Convert to string for analysis
-            str_values = series.astype(str).str.lower()
-            
-            # Check for patterns
-            if str_values.str.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$').mean() > 0.8:
-                return labels['ip_address']
-            
-            if str_values.str.contains('@').mean() > 0.8:
-                return labels['email']
-            
-            if str_values.str.match(r'^\d{4}-\d{2}-\d{2}').mean() > 0.8:
-                return labels['timestamp']
-            
-            if str_values.str.match(r'^\d+$').mean() > 0.8:
-                return labels['numeric_id']
-            
-            # Check column name
-            if any(term in column_name.lower() for term in ['host', 'server', 'machine']):
-                return labels['hostname']
-            
-            return labels['unknown']
-        
-        return labeling_function
-    
-    def create_labeling_functions(self, column_samples: Dict[str, List]) -> List[callable]:
-        """Create multiple labeling functions"""
-        functions = []
-        
-        for column_name, values in column_samples.items():
-            func = self.generate_function(column_name, values)
-            functions.append(func)
-        
-        return functions
+        return {'type': 'unknown', 'confidence': 0.0}
 
 class LLMClassifier:
-    """Main classifier using rule-based system instead of LLM"""
-    
     def __init__(self, config: Dict):
-        self.config = config
-        self.rule_classifier = RuleBasedClassifier(config)
-        self.label_generator = LabelingFunctionGenerator()
-        self.classification_cache = {}
+        # Remove OpenAI API key usage
+        self.model = config['model_config'].get('llm_model', 'rule-based')
+        self.batch_size = config['model_config'].get('llm_batch_size', 50)
+        self.weak_supervision_ratio = config['model_config'].get('weak_supervision_ratio', 0.013)
         
+        # Use rule-based classifier instead of OpenAI
+        self.rule_classifier = RuleBasedClassifier()
+        
+        self.label_model = LabelModel(cardinality=78, verbose=False)
+        self.labeling_functions = []
+    
+    async def generate_labeling_functions(self, column_samples: Dict[str, List]) -> List[LabelingFunction]:
+        """Generate labeling functions based on patterns"""
+        functions = []
+        
+        for column_name, values in list(column_samples.items())[:10]:
+            # Create pattern-based labeling function
+            def create_lf(col_name, sample_values):
+                def labeling_function(series):
+                    # Simple pattern matching
+                    str_values = series.astype(str)
+                    
+                    # Check for IPs
+                    if str_values.str.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$').mean() > 0.8:
+                        return 1  # IP address
+                    
+                    # Check for emails
+                    if str_values.str.contains('@').mean() > 0.8:
+                        return 2  # Email
+                    
+                    # Check for timestamps
+                    if str_values.str.match(r'^\d{4}-\d{2}-\d{2}').mean() > 0.8:
+                        return 3  # Timestamp
+                    
+                    # Check for numeric IDs
+                    if str_values.str.match(r'^\d+$').mean() > 0.8:
+                        return 4  # Numeric ID
+                    
+                    # Check column name
+                    if 'host' in col_name.lower():
+                        return 0  # Hostname
+                    
+                    return -1  # Abstain
+                
+                return labeling_function
+            
+            lf = create_lf(column_name, values)
+            lf_wrapper = LabelingFunction(name=f"lf_{len(functions)}", f=lf)
+            functions.append(lf_wrapper)
+        
+        self.labeling_functions.extend(functions)
+        return functions
+    
     async def classify_with_llm(self, column_name: str, values: List[Any]) -> Dict[str, Any]:
-        """Classify using rule-based system (renamed for compatibility)"""
-        
-        # Check cache
-        cache_key = f"{column_name}:{str(values[:5])}"
-        if cache_key in self.classification_cache:
-            return self.classification_cache[cache_key]
-        
-        # Classify
-        result = await self.rule_classifier.classify_with_rules(column_name, values)
-        
-        # Cache result
-        self.classification_cache[cache_key] = result
-        
-        return result
+        """Classify using rule-based system instead of LLM"""
+        try:
+            result = self.rule_classifier.classify(column_name, values)
+            return result
+        except Exception as e:
+            logger.error(f"Classification failed: {e}")
+            return {'type': 'unknown', 'confidence': 0.0}
     
-    async def generate_labeling_functions(self, column_samples: Dict[str, List]) -> List[callable]:
-        """Generate labeling functions for weak supervision"""
-        return self.label_generator.create_labeling_functions(column_samples)
-    
-    def train_weak_supervision(self, df: pd.DataFrame) -> tuple:
-        """Train weak supervision model (simplified without Snorkel)"""
+    def train_weak_supervision(self, df: pd.DataFrame):
+        """Train weak supervision model"""
+        if not self.labeling_functions:
+            return None, None
         
-        # Generate labeling functions
-        functions = self.label_generator.create_labeling_functions(
-            {col: df[col].tolist() for col in df.columns[:10]}
-        )
+        applier = PandasLFApplier(self.labeling_functions)
+        L = applier.apply(df)
         
-        # Apply labeling functions
-        labels = np.zeros((len(df), len(functions)))
+        self.label_model.fit(L)
         
-        for i, func in enumerate(functions):
-            for col in df.columns:
-                try:
-                    labels[:, i] = func(df[col])
-                except:
-                    pass
+        predictions = self.label_model.predict(L)
+        confidences = self.label_model.predict_proba(L)
         
-        # Simple majority vote
-        predictions = []
-        confidences = []
-        
-        for row in labels:
-            non_abstain = row[row != -1]
-            if len(non_abstain) > 0:
-                # Get most common label
-                counts = Counter(non_abstain)
-                if counts:
-                    most_common = counts.most_common(1)[0]
-                    predictions.append(int(most_common[0]))
-                    confidences.append(most_common[1] / len(non_abstain))
-                else:
-                    predictions.append(-1)
-                    confidences.append(0.0)
-            else:
-                predictions.append(-1)
-                confidences.append(0.0)
-        
-        return np.array(predictions), np.array(confidences)
+        return predictions, confidences

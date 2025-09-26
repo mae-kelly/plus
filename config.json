@@ -1,5 +1,5 @@
 {
-  "projects": ["your-project-id"],
+  "projects": ["test-project"],
   "max_workers": 4,
   "batch_size": 64,
   "device": "mps",

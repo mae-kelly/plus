@@ -2,10 +2,20 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import List, Any, Dict
-from sklearn.feature_extraction.text import TfidfVectorizer
 import hashlib
 from collections import Counter
 import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Try to import optional dependencies
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    TFIDF_AVAILABLE = True
+except ImportError:
+    TFIDF_AVAILABLE = False
+    logger.debug("TfidfVectorizer not available")
 
 class SimpleEmbedder(nn.Module):
     """Simple embedding model to replace SentenceTransformer"""
@@ -43,15 +53,67 @@ class SimpleEmbedder(nn.Module):
         
         return embedding
 
+class SimpleTfidfVectorizer:
+    """Fallback TF-IDF implementation"""
+    def __init__(self, max_features=500):
+        self.max_features = max_features
+        self.vocabulary = {}
+        self.idf = {}
+    
+    def fit_transform(self, texts):
+        # Build vocabulary
+        word_counts = Counter()
+        doc_counts = Counter()
+        
+        for text in texts:
+            words = set(text.lower().split())
+            for word in words:
+                doc_counts[word] += 1
+            word_counts.update(text.lower().split())
+        
+        # Select top features
+        top_words = [w for w, _ in word_counts.most_common(self.max_features)]
+        self.vocabulary = {word: idx for idx, word in enumerate(top_words)}
+        
+        # Calculate IDF
+        n_docs = len(texts)
+        for word in self.vocabulary:
+            self.idf[word] = np.log(n_docs / (doc_counts[word] + 1))
+        
+        return self.transform(texts)
+    
+    def transform(self, texts):
+        vectors = []
+        for text in texts:
+            vector = np.zeros(len(self.vocabulary))
+            words = text.lower().split()
+            word_counts = Counter(words)
+            
+            for word, count in word_counts.items():
+                if word in self.vocabulary:
+                    idx = self.vocabulary[word]
+                    # TF-IDF score
+                    tf = count / len(words) if words else 0
+                    vector[idx] = tf * self.idf.get(word, 0)
+            
+            vectors.append(vector)
+        
+        return np.array(vectors)
+
 class AdvancedFeatureExtractor:
     def __init__(self, device: str = 'mps'):
         self.device = device
         
-        # Use simple embedder instead of SentenceTransformer
+        # Use simple embedder
         self.embedder = SimpleEmbedder(device=device)
         self.embedder.eval()
         
-        self.tfidf = TfidfVectorizer(max_features=500, ngram_range=(1, 3))
+        # Use sklearn TfidfVectorizer if available, otherwise use simple implementation
+        if TFIDF_AVAILABLE:
+            self.tfidf = TfidfVectorizer(max_features=500, ngram_range=(1, 3))
+        else:
+            self.tfidf = SimpleTfidfVectorizer(max_features=500)
+            
         self.feature_cache = {}
         self.pattern_cache = {}
         
@@ -79,7 +141,7 @@ class AdvancedFeatureExtractor:
         distribution_features = self._extract_distribution_features(values)
         features.extend(distribution_features)
         
-        # Embedding features (using simple embedder)
+        # Embedding features
         embedding_features = self._extract_embedding_features(column_name, values)
         features.extend(embedding_features)
         
@@ -104,11 +166,11 @@ class AdvancedFeatureExtractor:
             features.extend([
                 np.mean(lengths),
                 np.median(lengths),
-                np.std(lengths),
+                np.std(lengths) if len(lengths) > 1 else 0,
                 np.min(lengths),
                 np.max(lengths),
-                np.percentile(lengths, 25),
-                np.percentile(lengths, 75),
+                np.percentile(lengths, 25) if lengths else 0,
+                np.percentile(lengths, 75) if lengths else 0,
                 len(set(lengths))
             ])
         else:
@@ -133,7 +195,7 @@ class AdvancedFeatureExtractor:
         if numeric_values:
             features.extend([
                 np.mean(numeric_values),
-                np.std(numeric_values),
+                np.std(numeric_values) if len(numeric_values) > 1 else 0,
                 np.min(numeric_values),
                 np.max(numeric_values),
                 len(numeric_values) / len(values)
@@ -169,8 +231,11 @@ class AdvancedFeatureExtractor:
         }
         
         for pattern_name, pattern_regex in patterns.items():
-            matches = sum(1 for v in str_values if re.match(pattern_regex, v))
-            features.append(matches / max(len(str_values), 1))
+            try:
+                matches = sum(1 for v in str_values if re.match(pattern_regex, v))
+                features.append(matches / max(len(str_values), 1))
+            except:
+                features.append(0)
         
         # Character class features
         char_features = self._extract_char_class_features(str_values)
@@ -181,7 +246,7 @@ class AdvancedFeatureExtractor:
     def _extract_char_class_features(self, values: List[str]) -> List[float]:
         features = []
         
-        all_text = ''.join(values)
+        all_text = ''.join(values[:100])  # Limit for performance
         if not all_text:
             return [0] * 20
         
@@ -209,6 +274,10 @@ class AdvancedFeatureExtractor:
         bigram_entropy = self._calculate_bigram_entropy(all_text)
         features.append(bigram_entropy)
         
+        # Pad to 20
+        while len(features) < 20:
+            features.append(0)
+        
         return features[:20]
     
     def _extract_semantic_features(self, column_name: str, values: List[Any]) -> List[float]:
@@ -233,6 +302,10 @@ class AdvancedFeatureExtractor:
         features.append(float(column_name.isupper()))
         features.append(float(column_name.islower()))
         
+        # Pad to 100
+        while len(features) < 100:
+            features.append(0)
+        
         return features[:100]
     
     def _extract_distribution_features(self, values: List[Any]) -> List[float]:
@@ -250,7 +323,7 @@ class AdvancedFeatureExtractor:
             features.append(max(frequencies))
             features.append(min(frequencies))
             features.append(np.mean(frequencies))
-            features.append(np.std(frequencies))
+            features.append(np.std(frequencies) if len(frequencies) > 1 else 0)
             
             # Top 10 frequency
             top_10_freq = sum(sorted(frequencies, reverse=True)[:10])
@@ -268,16 +341,13 @@ class AdvancedFeatureExtractor:
             length_counts = Counter(lengths)
             length_entropy = self._calculate_entropy_from_counts(length_counts)
             features.append(length_entropy)
-            
-            # Normality test
-            from scipy import stats
-            if len(set(lengths)) > 1:
-                _, p_value = stats.normaltest(lengths)
-                features.append(p_value)
-            else:
-                features.append(1.0)
+            features.append(0)  # Placeholder for normality test
         else:
-            features.extend([0, 1.0])
+            features.extend([0, 0])
+        
+        # Pad to 50
+        while len(features) < 50:
+            features.append(0)
         
         return features[:50]
     
@@ -288,7 +358,12 @@ class AdvancedFeatureExtractor:
         with torch.no_grad():
             embedding = self.embedder(sample_text)
         
-        return embedding.cpu().numpy().flatten()[:384]
+        # Ensure we return exactly 384 features
+        embedding_array = embedding.cpu().numpy().flatten()
+        if len(embedding_array) < 384:
+            embedding_array = np.pad(embedding_array, (0, 384 - len(embedding_array)), mode='constant')
+        
+        return embedding_array[:384]
     
     def _calculate_entropy(self, text: str) -> float:
         if not text:
@@ -317,7 +392,7 @@ class AdvancedFeatureExtractor:
         if total == 0:
             return 0
         
-        entropy = -sum((count/total) * np.log2(count/total) for count in counts.values())
+        entropy = -sum((count/total) * np.log2(count/total) for count in counts.values() if count > 0)
         
         return entropy
     

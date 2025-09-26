@@ -87,58 +87,6 @@ class BigQueryScanner:
         
         return self.client_managers[project_id].get_client()
     
-    def _safe_convert_value(self, value):
-        """Safely convert any value, handling arrays, NA, and complex types"""
-        # Handle None
-        if value is None:
-            return None
-        
-        # Handle pandas NA
-        try:
-            if pd.isna(value):
-                return None
-        except (TypeError, ValueError):
-            # pd.isna() failed, probably an array
-            pass
-        
-        # Handle numpy arrays and pandas Series
-        if isinstance(value, (np.ndarray, pd.Series)):
-            # Convert to list and recursively clean
-            if hasattr(value, 'tolist'):
-                list_val = value.tolist()
-            else:
-                list_val = list(value)
-            # Recursively clean list elements
-            return [self._safe_convert_value(v) for v in list_val]
-        
-        # Handle lists (including repeated fields from BigQuery)
-        if isinstance(value, list):
-            return [self._safe_convert_value(v) for v in value]
-        
-        # Handle dicts (STRUCT fields from BigQuery)
-        if isinstance(value, dict):
-            return {k: self._safe_convert_value(v) for k, v in value.items()}
-        
-        # Handle numpy scalar types
-        if hasattr(value, 'item'):
-            try:
-                return value.item()
-            except:
-                pass
-        
-        # Handle bytes
-        if isinstance(value, bytes):
-            return value.decode('utf-8', errors='ignore')
-        
-        # Handle floats that might be NaN
-        if isinstance(value, float):
-            if np.isnan(value):
-                return None
-            return value
-        
-        # Return as-is for other types (int, str, etc.)
-        return value
-    
     async def scan_all_projects(self) -> List[Dict]:
         """Scan all configured BigQuery projects"""
         all_data = []
@@ -304,7 +252,7 @@ class BigQueryScanner:
         return dataset_data
     
     async def scan_table(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
-        """Scan a BigQuery table and extract data"""
+        """Scan a BigQuery table and extract data - completely bypass pandas for problematic tables"""
         full_table_id = f"{project_id}.{dataset_id}.{table_id}"
         
         try:
@@ -325,6 +273,13 @@ class BigQueryScanner:
             logger.info(f"        📋 Columns: {', '.join(column_names[:10])}")
             if len(column_names) > 10:
                 logger.info(f"           ... and {len(column_names)-10} more columns")
+            
+            # Check if table has REPEATED or ARRAY fields
+            has_arrays = any(field.mode == 'REPEATED' for field in table.schema)
+            has_structs = any(field.field_type == 'RECORD' for field in table.schema)
+            
+            if has_arrays or has_structs:
+                logger.info(f"        ⚠️ Table has complex fields (arrays/structs), using safe mode")
             
             # Determine how many rows to sample
             sample_size = min(
@@ -351,29 +306,114 @@ class BigQueryScanner:
             
             logger.info(f"        ⏳ Executing query...")
             
-            # Execute query with timeout
+            # Execute query
             query_job = client.query(query)
             
-            # Convert to pandas DataFrame
-            df = query_job.to_dataframe()
-            
-            # CRITICAL FIX: Process DataFrame to handle arrays and NA values
-            # Process each column to fix array and NA issues
-            for col in df.columns:
-                # Apply safe conversion to entire column
-                df[col] = df[col].apply(self._safe_convert_value)
-            
-            # Now convert to records - all values should be safe
-            rows = df.to_dict('records')
-            
-            # Additional safety: clean the rows dict
-            cleaned_rows = []
-            for row in rows:
-                cleaned_row = {}
-                for key, value in row.items():
-                    cleaned_row[key] = self._safe_convert_value(value)
-                cleaned_rows.append(cleaned_row)
-            rows = cleaned_rows
+            # CRITICAL FIX: Use iterator approach for tables with arrays/complex types
+            if has_arrays or has_structs:
+                # Use row iterator to avoid pandas issues with arrays
+                rows = []
+                columns_data = defaultdict(list)
+                
+                for row in query_job.result():
+                    row_dict = {}
+                    for field in table.schema:
+                        field_name = field.name
+                        value = row.get(field_name)
+                        
+                        # Clean value
+                        if value is None:
+                            cleaned_value = None
+                        elif isinstance(value, list):
+                            # For REPEATED fields, convert to JSON string to avoid issues
+                            cleaned_value = json.dumps(value)
+                        elif isinstance(value, dict):
+                            # For RECORD/STRUCT fields, convert to JSON string
+                            cleaned_value = json.dumps(value)
+                        elif isinstance(value, bytes):
+                            cleaned_value = value.decode('utf-8', errors='ignore')
+                        else:
+                            cleaned_value = value
+                        
+                        row_dict[field_name] = cleaned_value
+                        columns_data[field_name].append(cleaned_value)
+                    
+                    rows.append(row_dict)
+                
+                # Build columns metadata
+                columns = {}
+                for field in table.schema:
+                    col_name = field.name
+                    col_values = columns_data.get(col_name, [])
+                    
+                    columns[col_name] = {
+                        'name': col_name,
+                        'type': field.field_type,
+                        'mode': field.mode,
+                        'samples': col_values[:100],
+                        'description': field.description
+                    }
+                    
+                    # Analyze column
+                    columns[col_name]['statistics'] = self._analyze_column(col_values)
+                    columns[col_name]['potential_type'] = self._infer_semantic_type(col_name, col_values)
+            else:
+                # For simple tables, use pandas but with aggressive cleaning
+                df = query_job.to_dataframe()
+                
+                # Aggressively handle NA values
+                for col in df.columns:
+                    try:
+                        # Replace any pandas NA with None
+                        df[col] = df[col].where(pd.notnull(df[col]), None)
+                    except:
+                        # If that fails, convert column to object type and try again
+                        df[col] = df[col].astype('object')
+                        df[col] = df[col].where(pd.notnull(df[col]), None)
+                
+                # Convert to records
+                rows = []
+                for _, row in df.iterrows():
+                    row_dict = {}
+                    for col in df.columns:
+                        value = row[col]
+                        # Final safety check
+                        if pd.isna(value):
+                            value = None
+                        elif isinstance(value, (np.ndarray, pd.Series)):
+                            value = value.tolist() if hasattr(value, 'tolist') else list(value)
+                        row_dict[col] = value
+                    rows.append(row_dict)
+                
+                # Build columns metadata
+                columns = {}
+                for field in table.schema:
+                    col_name = field.name
+                    
+                    if col_name in df.columns:
+                        # Get column values safely
+                        col_values = []
+                        for val in df[col_name]:
+                            if pd.isna(val):
+                                col_values.append(None)
+                            elif isinstance(val, (np.ndarray, pd.Series)):
+                                col_values.append(val.tolist() if hasattr(val, 'tolist') else list(val))
+                            else:
+                                col_values.append(val)
+                    else:
+                        col_values = []
+                    
+                    columns[col_name] = {
+                        'name': col_name,
+                        'type': field.field_type,
+                        'mode': field.mode,
+                        'samples': col_values[:100],
+                        'description': field.description
+                    }
+                    
+                    # Analyze column
+                    columns[col_name]['statistics'] = self._analyze_column(col_values)
+                    columns[col_name]['potential_type'] = self._infer_semantic_type(col_name, col_values)
             
             if not rows:
                 logger.warning(f"        ⚠️ No rows returned from {table_id}")
@@ -381,37 +421,10 @@ class BigQueryScanner:
             
             logger.info(f"        ✅ Retrieved {len(rows)} rows")
             
-            # Convert to standard format
-            columns = {}
-            
-            # Process columns
-            for field in table.schema:
-                col_name = field.name
-                
-                if col_name in df.columns:
-                    # Get column values safely
-                    col_values = []
-                    for val in df[col_name]:
-                        cleaned_val = self._safe_convert_value(val)
-                        col_values.append(cleaned_val)
-                else:
-                    col_values = []
-                
-                columns[col_name] = {
-                    'name': col_name,
-                    'type': field.field_type,
-                    'mode': field.mode,
-                    'samples': col_values[:100],  # Keep first 100 samples
-                    'description': field.description
-                }
-                
-                # Analyze column for discovery patterns
-                columns[col_name]['statistics'] = self._analyze_column(col_values)
-                columns[col_name]['potential_type'] = self._infer_semantic_type(col_name, col_values)
-                
-                # Log interesting columns
-                if columns[col_name]['potential_type'] in ['hostname', 'ip_address']:
-                    logger.info(f"        🎯 Found {columns[col_name]['potential_type']} column: {col_name}")
+            # Log interesting columns
+            for col_name, col_info in columns.items():
+                if col_info['potential_type'] in ['hostname', 'ip_address']:
+                    logger.info(f"        🎯 Found {col_info['potential_type']} column: {col_name}")
             
             self.rows_processed += len(rows)
             
@@ -450,15 +463,22 @@ class BigQueryScanner:
         if not samples:
             return {}
         
-        # Filter out None values safely
+        # Filter out None values and handle JSON strings
         non_null = []
         for s in samples:
             if s is not None:
-                # Handle lists/arrays in samples
-                if isinstance(s, list):
-                    # For arrays, analyze the first element or treat as JSON
-                    if s:
-                        non_null.append(str(s[0]))
+                # If it's a JSON string (from array/struct), try to parse it
+                if isinstance(s, str) and s.startswith(('[', '{')):
+                    try:
+                        parsed = json.loads(s)
+                        if isinstance(parsed, list) and parsed:
+                            non_null.append(str(parsed[0]))
+                        elif isinstance(parsed, dict):
+                            non_null.append(str(parsed))
+                        else:
+                            non_null.append(s)
+                    except:
+                        non_null.append(s)
                 else:
                     non_null.append(s)
         
@@ -476,25 +496,13 @@ class BigQueryScanner:
         if non_null:
             # Check for IP addresses
             ip_pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
-            ip_matches = 0
-            for s in non_null:
-                try:
-                    if re.match(ip_pattern, str(s)):
-                        ip_matches += 1
-                except:
-                    pass
+            ip_matches = sum(1 for s in non_null if re.match(ip_pattern, str(s)))
             stats['ip_likelihood'] = ip_matches / len(non_null) if non_null else 0
             
             # Check for hostnames/FQDNs
             hostname_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$'
-            hostname_matches = 0
-            for s in non_null:
-                try:
-                    s_str = str(s)
-                    if re.match(hostname_pattern, s_str) and '.' in s_str:
-                        hostname_matches += 1
-                except:
-                    pass
+            hostname_matches = sum(1 for s in non_null 
+                                 if re.match(hostname_pattern, str(s)) and '.' in str(s))
             stats['hostname_likelihood'] = hostname_matches / len(non_null) if non_null else 0
         
         return stats
@@ -518,36 +526,28 @@ class BigQueryScanner:
             non_null = []
             for s in samples[:100]:
                 if s is not None:
-                    # Handle arrays
-                    if isinstance(s, list):
-                        if s:
-                            non_null.append(str(s[0]))
+                    # Handle JSON strings from arrays/structs
+                    if isinstance(s, str) and s.startswith(('[', '{')):
+                        try:
+                            parsed = json.loads(s)
+                            if isinstance(parsed, list) and parsed:
+                                non_null.append(str(parsed[0]))
+                        except:
+                            non_null.append(s)
                     else:
                         non_null.append(s)
             
             if non_null:
                 # Check for IP pattern
-                ip_matches = 0
-                for s in non_null:
-                    try:
-                        if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', str(s)):
-                            ip_matches += 1
-                    except:
-                        pass
-                
+                ip_matches = sum(1 for s in non_null 
+                               if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', str(s)))
                 if ip_matches > len(non_null) * 0.8:
                     return 'ip_address'
                 
                 # Check for hostname/FQDN pattern
-                hostname_matches = 0
-                for s in non_null:
-                    try:
-                        s_str = str(s)
-                        if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', s_str) and '.' in s_str:
-                            hostname_matches += 1
-                    except:
-                        pass
-                
+                hostname_matches = sum(1 for s in non_null 
+                                     if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', str(s))
+                                     and '.' in str(s))
                 if hostname_matches > len(non_null) * 0.6:
                     return 'hostname'
         

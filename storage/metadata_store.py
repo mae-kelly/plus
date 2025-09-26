@@ -12,61 +12,79 @@ class MetadataStore:
         
         self.es_client = None
         if config['storage'].get('elasticsearch_host'):
-            self.es_client = Elasticsearch([config['storage']['elasticsearch_host']])
-            self._init_elasticsearch()
+            # Fix: Ensure proper URL format for Elasticsearch
+            es_host = config['storage']['elasticsearch_host']
+            
+            # Add http:// if no scheme is present
+            if not es_host.startswith(('http://', 'https://')):
+                es_host = f'http://{es_host}'
+            
+            try:
+                self.es_client = Elasticsearch([es_host])
+                self._init_elasticsearch()
+            except Exception as e:
+                logger.warning(f"Elasticsearch connection failed: {e}. Continuing without Elasticsearch.")
+                self.es_client = None
         
         self.neo4j_driver = None
         if config['storage'].get('neo4j_uri'):
-            self.neo4j_driver = GraphDatabase.driver(
-                config['storage']['neo4j_uri'],
-                auth=(config['storage'].get('neo4j_user', 'neo4j'),
-                      config['storage'].get('neo4j_password', 'password'))
-            )
+            try:
+                self.neo4j_driver = GraphDatabase.driver(
+                    config['storage']['neo4j_uri'],
+                    auth=(config['storage'].get('neo4j_user', 'neo4j'),
+                          config['storage'].get('neo4j_password', 'password'))
+                )
+            except Exception as e:
+                logger.warning(f"Neo4j connection failed: {e}. Continuing without Neo4j.")
+                self.neo4j_driver = None
     
     def _init_elasticsearch(self):
-        index_config = {
-            'settings': {
-                'number_of_shards': 3,
-                'number_of_replicas': 1,
-                'analysis': {
-                    'analyzer': {
-                        'hostname_analyzer': {
-                            'tokenizer': 'hostname_tokenizer',
-                            'filter': ['lowercase', 'stop']
-                        }
-                    },
-                    'tokenizer': {
-                        'hostname_tokenizer': {
-                            'type': 'pattern',
-                            'pattern': '[._-]'
+        try:
+            index_config = {
+                'settings': {
+                    'number_of_shards': 3,
+                    'number_of_replicas': 1,
+                    'analysis': {
+                        'analyzer': {
+                            'hostname_analyzer': {
+                                'tokenizer': 'hostname_tokenizer',
+                                'filter': ['lowercase', 'stop']
+                            }
+                        },
+                        'tokenizer': {
+                            'hostname_tokenizer': {
+                                'type': 'pattern',
+                                'pattern': '[._-]'
+                            }
                         }
                     }
-                }
-            },
-            'mappings': {
-                'properties': {
-                    'hostname': {
-                        'type': 'text',
-                        'analyzer': 'hostname_analyzer',
-                        'fields': {
-                            'keyword': {'type': 'keyword'}
-                        }
-                    },
-                    'raw_forms': {'type': 'text'},
-                    'confidence': {'type': 'float'},
-                    'quality_score': {'type': 'float'},
-                    'discovered_at': {'type': 'date'},
-                    'attributes': {'type': 'object', 'enabled': False},
-                    'environment': {'type': 'keyword'},
-                    'datacenter': {'type': 'keyword'},
-                    'os_type': {'type': 'keyword'}
+                },
+                'mappings': {
+                    'properties': {
+                        'hostname': {
+                            'type': 'text',
+                            'analyzer': 'hostname_analyzer',
+                            'fields': {
+                                'keyword': {'type': 'keyword'}
+                            }
+                        },
+                        'raw_forms': {'type': 'text'},
+                        'confidence': {'type': 'float'},
+                        'quality_score': {'type': 'float'},
+                        'discovered_at': {'type': 'date'},
+                        'attributes': {'type': 'object', 'enabled': False},
+                        'environment': {'type': 'keyword'},
+                        'datacenter': {'type': 'keyword'},
+                        'os_type': {'type': 'keyword'}
+                    }
                 }
             }
-        }
-        
-        if not self.es_client.indices.exists(index='cmdb_hosts'):
-            self.es_client.indices.create(index='cmdb_hosts', body=index_config)
-            logger.info("Elasticsearch index created")
+            
+            if not self.es_client.indices.exists(index='cmdb_hosts'):
+                self.es_client.indices.create(index='cmdb_hosts', body=index_config)
+                logger.info("Elasticsearch index created")
+        except Exception as e:
+            logger.error(f"Failed to initialize Elasticsearch index: {e}")
     
     async def persist_metadata(self, column_metadata: Dict):
         metadata_doc = {
@@ -85,13 +103,17 @@ class MetadataStore:
             metadata_doc['columns'].append(column_doc)
         
         if self.es_client:
-            self.es_client.index(
-                index='cmdb_metadata',
-                body=metadata_doc,
-                id='column_metadata'
-            )
-            logger.info("Metadata persisted to Elasticsearch")
+            try:
+                self.es_client.index(
+                    index='cmdb_metadata',
+                    body=metadata_doc,
+                    id='column_metadata'
+                )
+                logger.info("Metadata persisted to Elasticsearch")
+            except Exception as e:
+                logger.error(f"Failed to persist metadata to Elasticsearch: {e}")
         
+        # Always save to file as backup
         with open('metadata.json', 'w') as f:
             json.dump(metadata_doc, f, indent=2)
     
@@ -128,25 +150,28 @@ class MetadataStore:
         if not self.neo4j_driver:
             return
         
-        with self.neo4j_driver.session() as session:
-            for rel in relationships:
-                try:
-                    session.run("""
-                        MERGE (a:Host {name: $source})
-                        MERGE (b:Host {name: $target})
-                        MERGE (a)-[r:RELATED {
-                            type: $rel_type,
-                            confidence: $confidence
-                        }]->(b)
-                    """, source=rel['source'],
-                         target=rel['target'],
-                         rel_type=rel['type'],
-                         confidence=rel.get('confidence', 0.5))
-                    
-                except Exception as e:
-                    logger.error(f"Failed to create graph relationship: {e}")
-        
-        logger.info(f"Created {len(relationships)} graph relationships")
+        try:
+            with self.neo4j_driver.session() as session:
+                for rel in relationships:
+                    try:
+                        session.run("""
+                            MERGE (a:Host {name: $source})
+                            MERGE (b:Host {name: $target})
+                            MERGE (a)-[r:RELATED {
+                                type: $rel_type,
+                                confidence: $confidence
+                            }]->(b)
+                        """, source=rel['source'],
+                             target=rel['target'],
+                             rel_type=rel['type'],
+                             confidence=rel.get('confidence', 0.5))
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create graph relationship: {e}")
+            
+            logger.info(f"Created {len(relationships)} graph relationships")
+        except Exception as e:
+            logger.error(f"Failed to create graph relationships: {e}")
     
     def search_hosts(self, query: str, size: int = 100) -> List[Dict]:
         if not self.es_client:
@@ -179,33 +204,40 @@ class MetadataStore:
         if not self.neo4j_driver:
             return {}
         
-        with self.neo4j_driver.session() as session:
-            result = session.run("""
-                MATCH path = (h:Host {name: $hostname})-[*1..$depth]-(connected)
-                RETURN path
-            """, hostname=hostname, depth=depth)
-            
-            nodes = set()
-            edges = []
-            
-            for record in result:
-                path = record['path']
+        try:
+            with self.neo4j_driver.session() as session:
+                result = session.run("""
+                    MATCH path = (h:Host {name: $hostname})-[*1..$depth]-(connected)
+                    RETURN path
+                """, hostname=hostname, depth=depth)
                 
-                for node in path.nodes:
-                    nodes.add(node['name'])
+                nodes = set()
+                edges = []
                 
-                for rel in path.relationships:
-                    edges.append({
-                        'source': rel.start_node['name'],
-                        'target': rel.end_node['name'],
-                        'type': rel.get('type', 'related')
-                    })
-            
-            return {
-                'nodes': list(nodes),
-                'edges': edges
-            }
+                for record in result:
+                    path = record['path']
+                    
+                    for node in path.nodes:
+                        nodes.add(node['name'])
+                    
+                    for rel in path.relationships:
+                        edges.append({
+                            'source': rel.start_node['name'],
+                            'target': rel.end_node['name'],
+                            'type': rel.get('type', 'related')
+                        })
+                
+                return {
+                    'nodes': list(nodes),
+                    'edges': edges
+                }
+        except Exception as e:
+            logger.error(f"Failed to get host graph: {e}")
+            return {}
     
     def close(self):
         if self.neo4j_driver:
-            self.neo4j_driver.close()
+            try:
+                self.neo4j_driver.close()
+            except:
+                pass

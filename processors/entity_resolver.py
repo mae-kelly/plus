@@ -1,17 +1,31 @@
+# processors/entity_resolver.py
+"""
+Entity Resolver - Deduplicates and resolves entities across all tables
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, List, Set, Tuple
-import faiss
-import networkx as nx
-from collections import defaultdict
+from typing import Dict, List, Set, Tuple, Optional
 import re
+from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Try to import faiss, but make it optional
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    logger.debug("FAISS not available, using fallback similarity search")
 
 class TextEncoder(nn.Module):
     """Simple text encoder to replace SentenceTransformer"""
-    def __init__(self, embed_dim: int = 384, device: str = 'mps'):
+    def __init__(self, embed_dim: int = 384, device: str = 'cpu'):
         super().__init__()
-        self.device = device
+        self.device = device if torch.cuda.is_available() or device == 'cpu' else 'cpu'
         
         # Character-level embedding
         self.char_embed = nn.Embedding(256, 64)
@@ -24,7 +38,7 @@ class TextEncoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.projection = nn.Linear(256, embed_dim)
         
-        self.to(device)
+        self.to(self.device)
     
     def encode(self, text: str) -> np.ndarray:
         """Encode text to embedding"""
@@ -48,23 +62,37 @@ class TextEncoder(nn.Module):
         return embedding.cpu().numpy().flatten()
 
 class EntityResolver:
-    def __init__(self, config: Dict, device: str = 'mps'):
+    def __init__(self, config: Dict = None, device: str = 'cpu'):
+        if config is None:
+            config = {
+                'entity_resolution': {
+                    'comparison_threshold': 0.7,
+                    'confidence_levels': [0.8, 0.9, 0.95]
+                }
+            }
+        
         self.config = config
-        self.device = device
+        self.device = device if torch.cuda.is_available() or device == 'cpu' else 'cpu'
         
-        # Use simple text encoder instead of SentenceTransformer
-        self.encoder = TextEncoder(device=device)
+        # Use simple text encoder
+        self.encoder = TextEncoder(device=self.device)
         
-        self.blocking_threshold = config['entity_resolution']['comparison_threshold']
-        self.confidence_levels = config['entity_resolution']['confidence_levels']
+        # Get config values with defaults
+        entity_config = config.get('entity_resolution', {})
+        self.blocking_threshold = entity_config.get('comparison_threshold', 0.7)
+        self.confidence_levels = entity_config.get('confidence_levels', [0.8, 0.9, 0.95])
         
         self.lsh_index = None
         self.entity_embeddings = {}
         self.blocking_keys = defaultdict(set)
         
-        self.similarity_model = SimilarityModel(device)
+        self.similarity_model = SimilarityModel(self.device)
     
-    async def resolve(self, hosts: Dict, metadata: Dict) -> Dict:
+    async def resolve(self, hosts: Dict, metadata: Dict = None) -> Dict:
+        """Resolve and deduplicate entities"""
+        if metadata is None:
+            metadata = {}
+            
         # Build blocking index
         self._build_blocking_index(hosts)
         
@@ -100,12 +128,16 @@ class EntityResolver:
         return resolved_entities
     
     def _build_blocking_index(self, hosts: Dict):
+        """Build blocking index for efficient candidate generation"""
         embeddings = []
         entity_list = []
         
         for hostname, data in hosts.items():
             # Create text representation
-            text = f"{hostname} " + " ".join(str(f) for f in data.get('raw_forms', []))
+            raw_forms = data.get('raw_forms', [])
+            if isinstance(raw_forms, set):
+                raw_forms = list(raw_forms)
+            text = f"{hostname} " + " ".join(str(f) for f in raw_forms[:10])
             
             # Get embedding using our encoder
             embedding = self.encoder.encode(text)
@@ -118,19 +150,28 @@ class EntityResolver:
             for blocking_key in self._generate_blocking_keys(hostname):
                 self.blocking_keys[blocking_key].add(hostname)
         
-        # Build LSH index
-        if embeddings:
+        # Build LSH index if FAISS available
+        if FAISS_AVAILABLE and embeddings:
             embeddings_matrix = np.array(embeddings).astype('float32')
             
             dim = embeddings_matrix.shape[1]
-            self.lsh_index = faiss.IndexLSHF(dim, 256)
+            # Use simple index for small datasets
+            if len(embeddings) < 10000:
+                self.lsh_index = faiss.IndexFlatL2(dim)
+            else:
+                # Use LSH for larger datasets
+                self.lsh_index = faiss.IndexLSHF(dim, 256)
             self.lsh_index.add(embeddings_matrix)
     
     def _generate_blocking_keys(self, hostname: str) -> Set[str]:
+        """Generate blocking keys for candidate generation"""
         keys = set()
         
         hostname_lower = hostname.lower()
-        keys.add(hostname_lower[:3])
+        
+        # First 3 characters
+        if len(hostname_lower) >= 3:
+            keys.add(hostname_lower[:3])
         
         # Split by delimiters
         parts = re.split(r'[\.\-_]', hostname_lower)
@@ -151,44 +192,55 @@ class EntityResolver:
         return keys
     
     def _generate_candidates(self, hosts: Dict) -> List[Tuple[str, str]]:
+        """Generate candidate pairs for comparison"""
         candidates = set()
         
         # Blocking-based candidates
         for key, entities in self.blocking_keys.items():
-            if len(entities) > 1:
+            if len(entities) > 1 and len(entities) < 100:  # Avoid very large blocks
                 entity_list = list(entities)
                 for i in range(len(entity_list)):
-                    for j in range(i + 1, len(entity_list)):
+                    for j in range(i + 1, min(i + 10, len(entity_list))):  # Limit comparisons
                         candidates.add(tuple(sorted([entity_list[i], entity_list[j]])))
         
-        # LSH-based candidates
-        if self.lsh_index and len(hosts) < 10000:
-            for hostname in list(hosts.keys())[:1000]:
+        # LSH-based candidates (if available and not too many hosts)
+        if FAISS_AVAILABLE and self.lsh_index and len(hosts) < 10000:
+            host_list = list(hosts.keys())
+            for i, hostname in enumerate(host_list[:1000]):  # Limit for performance
                 if hostname in self.entity_embeddings:
                     query = self.entity_embeddings[hostname].reshape(1, -1)
-                    D, I = self.lsh_index.search(query, 10)
+                    # Search for k nearest neighbors
+                    k = min(10, len(hosts))
+                    D, I = self.lsh_index.search(query, k)
                     
                     for idx in I[0]:
-                        if idx >= 0 and idx < len(hosts):
-                            candidate = list(hosts.keys())[idx]
+                        if 0 <= idx < len(host_list) and idx != i:
+                            candidate = host_list[idx]
                             if candidate != hostname:
                                 candidates.add(tuple(sorted([hostname, candidate])))
         
         return list(candidates)
     
     async def _calculate_similarity(self, entity1_data: Dict, entity2_data: Dict) -> float:
+        """Calculate similarity between two entities"""
         scores = []
         
         # Name similarity
-        name_sim = self._string_similarity(
-            str(entity1_data.get('hostname', '')),
-            str(entity2_data.get('hostname', ''))
-        )
+        name1 = str(entity1_data.get('hostname', ''))
+        name2 = str(entity2_data.get('hostname', ''))
+        name_sim = self._string_similarity(name1, name2)
         scores.append(name_sim * 0.4)
         
         # Raw forms similarity
-        raw_forms1 = set(entity1_data.get('raw_forms', []))
-        raw_forms2 = set(entity2_data.get('raw_forms', []))
+        raw_forms1 = entity1_data.get('raw_forms', [])
+        raw_forms2 = entity2_data.get('raw_forms', [])
+        
+        # Convert to sets if needed
+        if isinstance(raw_forms1, list):
+            raw_forms1 = set(raw_forms1)
+        if isinstance(raw_forms2, list):
+            raw_forms2 = set(raw_forms2)
+            
         if raw_forms1 and raw_forms2:
             jaccard = len(raw_forms1 & raw_forms2) / len(raw_forms1 | raw_forms2)
             scores.append(jaccard * 0.3)
@@ -200,34 +252,37 @@ class EntityResolver:
         common_attrs = set(attrs1.keys()) & set(attrs2.keys())
         if common_attrs:
             attr_similarities = []
-            for attr in common_attrs:
+            for attr in list(common_attrs)[:20]:  # Limit for performance
                 val1 = attrs1[attr]
                 val2 = attrs2[attr]
                 
-                if isinstance(val1, list):
-                    val1 = val1[0] if val1 else ''
-                if isinstance(val2, list):
-                    val2 = val2[0] if val2 else ''
+                if isinstance(val1, list) and val1:
+                    val1 = val1[0]
+                if isinstance(val2, list) and val2:
+                    val2 = val2[0]
                 
-                attr_sim = self._string_similarity(str(val1), str(val2))
-                attr_similarities.append(attr_sim)
+                if val1 and val2:
+                    attr_sim = self._string_similarity(str(val1), str(val2))
+                    attr_similarities.append(attr_sim)
             
-            scores.append(np.mean(attr_similarities) * 0.3)
+            if attr_similarities:
+                scores.append(np.mean(attr_similarities) * 0.3)
         
         return sum(scores)
     
     def _string_similarity(self, s1: str, s2: str) -> float:
+        """Calculate string similarity"""
         s1, s2 = s1.lower(), s2.lower()
         
         if s1 == s2:
             return 1.0
         
+        # Use simple character-based similarity
         from difflib import SequenceMatcher
-        ratio = SequenceMatcher(None, s1, s2).ratio()
-        
-        return ratio
+        return SequenceMatcher(None, s1, s2).ratio()
     
     def _select_master(self, entities: List[str]) -> str:
+        """Select the master entity from candidates"""
         scores = {}
         
         for entity in entities:
@@ -249,6 +304,7 @@ class EntityResolver:
         return max(scores, key=scores.get)
     
     def _merge_entities(self, entity1: Dict, entity2: Dict) -> Dict:
+        """Merge two entities into one"""
         merged = {
             'raw_forms': set(),
             'occurrences': [],
@@ -256,8 +312,18 @@ class EntityResolver:
         }
         
         # Merge raw forms
-        merged['raw_forms'].update(entity1.get('raw_forms', []))
-        merged['raw_forms'].update(entity2.get('raw_forms', []))
+        raw1 = entity1.get('raw_forms', [])
+        raw2 = entity2.get('raw_forms', [])
+        
+        if isinstance(raw1, set):
+            merged['raw_forms'].update(raw1)
+        else:
+            merged['raw_forms'].update(raw1)
+            
+        if isinstance(raw2, set):
+            merged['raw_forms'].update(raw2)
+        else:
+            merged['raw_forms'].update(raw2)
         
         # Merge occurrences
         merged['occurrences'].extend(entity1.get('occurrences', []))
@@ -276,7 +342,7 @@ class EntityResolver:
             else:
                 merged['attributes'][attr].append(values)
         
-        # Deduplicate
+        # Deduplicate attribute values
         for attr in merged['attributes']:
             values = merged['attributes'][attr]
             unique_values = []
@@ -288,14 +354,19 @@ class EntityResolver:
                     unique_values.append(val)
                     seen.add(val_str)
             
-            merged['attributes'][attr] = unique_values[:10]
+            merged['attributes'][attr] = unique_values[:10]  # Limit to 10 values
+        
+        # Convert raw_forms back to list for serialization
+        merged['raw_forms'] = list(merged['raw_forms'])
         
         return merged
 
 class SimilarityModel(nn.Module):
-    def __init__(self, device: str = 'mps'):
+    """Neural network model for similarity scoring"""
+    def __init__(self, device: str = 'cpu'):
         super().__init__()
         
+        self.device = device if torch.cuda.is_available() or device == 'cpu' else 'cpu'
         self.embedding_dim = 384
         
         self.encoder = nn.Sequential(
@@ -316,7 +387,7 @@ class SimilarityModel(nn.Module):
             nn.Sigmoid()
         )
         
-        self.to(device)
+        self.to(self.device)
     
     def forward(self, emb1, emb2):
         combined = torch.cat([emb1, emb2], dim=-1)

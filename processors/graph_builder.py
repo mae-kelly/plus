@@ -1,414 +1,591 @@
+# processors/graph_builder.py
+"""
+Graph Builder - Constructs knowledge graph from discovered hosts and relationships
+"""
+
 import torch
-import torch.nn as nn
 import numpy as np
-from typing import List, Any, Dict
-import hashlib
-from collections import Counter
-import re
+from typing import Dict, List, Tuple, Any, Optional
+import networkx as nx
+from collections import defaultdict, Counter
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
-# Try to import optional dependencies
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    TFIDF_AVAILABLE = True
-except ImportError:
-    TFIDF_AVAILABLE = False
-    logger.debug("TfidfVectorizer not available")
-
-class SimpleEmbedder(nn.Module):
-    """Simple embedding model to replace SentenceTransformer"""
-    def __init__(self, vocab_size: int = 5000, embed_dim: int = 384, device: str = 'mps'):
-        super().__init__()
-        self.device = device
-        
-        # Character-level CNN
-        self.char_embed = nn.Embedding(256, 32)
-        self.conv1 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
-        self.pool = nn.AdaptiveMaxPool1d(1)
-        
-        # Final projection
-        self.projection = nn.Linear(128, embed_dim)
-        
-        self.to(device)
+class GraphBuilder:
+    """Builds comprehensive knowledge graph from CMDB data"""
     
-    def forward(self, text: str) -> torch.Tensor:
-        # Convert text to character indices
-        chars = [ord(c) % 256 for c in text[:500]]
-        if not chars:
-            return torch.zeros(1, 384, device=self.device)
+    def __init__(self, config: Dict):
+        self.config = config
+        self.graph = nx.MultiDiGraph()  # Directed graph with multiple edges
+        self.node_embeddings = {}
+        self.edge_embeddings = {}
+        self.communities = []
+        self.centrality_scores = {}
         
-        char_tensor = torch.tensor(chars, device=self.device).unsqueeze(0)
+    async def build(self, hosts: List[Dict], relationships: List[Dict]) -> Dict:
+        """Build complete knowledge graph"""
+        logger.info("Building knowledge graph...")
         
-        # Embed and convolve
-        x = self.char_embed(char_tensor).transpose(1, 2)
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = self.pool(x).squeeze(-1)
+        # Add nodes (hosts)
+        for host in hosts:
+            self._add_host_node(host)
         
-        # Project to final dimension
-        embedding = self.projection(x)
+        # Add edges (relationships)
+        for rel in relationships:
+            self._add_relationship_edge(rel)
         
-        return embedding
-
-class SimpleTfidfVectorizer:
-    """Fallback TF-IDF implementation"""
-    def __init__(self, max_features=500):
-        self.max_features = max_features
-        self.vocabulary = {}
-        self.idf = {}
-    
-    def fit_transform(self, texts):
-        # Build vocabulary
-        word_counts = Counter()
-        doc_counts = Counter()
+        # Calculate graph metrics
+        self._calculate_metrics()
         
-        for text in texts:
-            words = set(text.lower().split())
-            for word in words:
-                doc_counts[word] += 1
-            word_counts.update(text.lower().split())
+        # Detect communities
+        self._detect_communities()
         
-        # Select top features
-        top_words = [w for w, _ in word_counts.most_common(self.max_features)]
-        self.vocabulary = {word: idx for idx, word in enumerate(top_words)}
+        # Find critical paths
+        critical_paths = self._find_critical_paths()
         
-        # Calculate IDF
-        n_docs = len(texts)
-        for word in self.vocabulary:
-            self.idf[word] = np.log(n_docs / (doc_counts[word] + 1))
+        # Generate embeddings
+        await self._generate_embeddings()
         
-        return self.transform(texts)
-    
-    def transform(self, texts):
-        vectors = []
-        for text in texts:
-            vector = np.zeros(len(self.vocabulary))
-            words = text.lower().split()
-            word_counts = Counter(words)
-            
-            for word, count in word_counts.items():
-                if word in self.vocabulary:
-                    idx = self.vocabulary[word]
-                    # TF-IDF score
-                    tf = count / len(words) if words else 0
-                    vector[idx] = tf * self.idf.get(word, 0)
-            
-            vectors.append(vector)
+        # Build hierarchy
+        hierarchy = self._build_hierarchy()
         
-        return np.array(vectors)
-
-class AdvancedFeatureExtractor:
-    def __init__(self, device: str = 'mps'):
-        self.device = device
-        
-        # Use simple embedder
-        self.embedder = SimpleEmbedder(device=device)
-        self.embedder.eval()
-        
-        # Use sklearn TfidfVectorizer if available, otherwise use simple implementation
-        if TFIDF_AVAILABLE:
-            self.tfidf = TfidfVectorizer(max_features=500, ngram_range=(1, 3))
-        else:
-            self.tfidf = SimpleTfidfVectorizer(max_features=500)
-            
-        self.feature_cache = {}
-        self.pattern_cache = {}
-        
-    async def extract(self, column_name: str, values: List[Any]) -> np.ndarray:
-        cache_key = self._get_cache_key(column_name, values[:10])
-        
-        if cache_key in self.feature_cache:
-            return self.feature_cache[cache_key]
-        
-        features = []
-        
-        # Statistical features
-        statistical_features = self._extract_statistical_features(values)
-        features.extend(statistical_features)
-        
-        # Pattern features
-        pattern_features = self._extract_pattern_features(values)
-        features.extend(pattern_features)
-        
-        # Semantic features
-        semantic_features = self._extract_semantic_features(column_name, values)
-        features.extend(semantic_features)
-        
-        # Distribution features
-        distribution_features = self._extract_distribution_features(values)
-        features.extend(distribution_features)
-        
-        # Embedding features
-        embedding_features = self._extract_embedding_features(column_name, values)
-        features.extend(embedding_features)
-        
-        # Pad or truncate to 1588
-        features = np.array(features, dtype=np.float32)
-        
-        if len(features) < 1588:
-            features = np.pad(features, (0, 1588 - len(features)), mode='constant')
-        elif len(features) > 1588:
-            features = features[:1588]
-        
-        self.feature_cache[cache_key] = features
-        return features
-    
-    def _extract_statistical_features(self, values: List[Any]) -> List[float]:
-        features = []
-        
-        str_values = [str(v) if v is not None else '' for v in values]
-        lengths = [len(v) for v in str_values]
-        
-        if lengths:
-            features.extend([
-                np.mean(lengths),
-                np.median(lengths),
-                np.std(lengths) if len(lengths) > 1 else 0,
-                np.min(lengths),
-                np.max(lengths),
-                np.percentile(lengths, 25) if lengths else 0,
-                np.percentile(lengths, 75) if lengths else 0,
-                len(set(lengths))
-            ])
-        else:
-            features.extend([0] * 8)
-        
-        # Unique ratio
-        unique_ratio = len(set(str_values)) / max(len(str_values), 1)
-        features.append(unique_ratio)
-        
-        # Null ratio
-        null_ratio = sum(1 for v in values if v is None or v == '') / max(len(values), 1)
-        features.append(null_ratio)
-        
-        # Numeric values
-        numeric_values = []
-        for v in values:
-            try:
-                numeric_values.append(float(v))
-            except:
-                pass
-        
-        if numeric_values:
-            features.extend([
-                np.mean(numeric_values),
-                np.std(numeric_values) if len(numeric_values) > 1 else 0,
-                np.min(numeric_values),
-                np.max(numeric_values),
-                len(numeric_values) / len(values)
-            ])
-        else:
-            features.extend([0] * 5)
-        
-        return features[:50]
-    
-    def _extract_pattern_features(self, values: List[Any]) -> List[float]:
-        features = []
-        str_values = [str(v) if v is not None else '' for v in values]
-        
-        patterns = {
-            'email': r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
-            'url': r'^https?://[^\s]+$',
-            'ipv4': r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$',
-            'ipv6': r'^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$',
-            'uuid': r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$',
-            'date_iso': r'^\d{4}-\d{2}-\d{2}',
-            'datetime_iso': r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}',
-            'phone_us': r'^(\+1)?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}$',
-            'hostname': r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?$',
-            'fqdn': r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?(\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?)*$',
-            'mac_address': r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$',
-            'md5': r'^[a-f0-9]{32}$',
-            'sha1': r'^[a-f0-9]{40}$',
-            'sha256': r'^[a-f0-9]{64}$',
-            'base64': r'^[A-Za-z0-9+/]+=*$',
-            'json': r'^\{.*\}$|^\[.*\]$',
-            'xml': r'^<.*>.*</.*>$',
-            'credit_card': r'^\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}$'
+        # Create graph summary
+        graph_data = {
+            'nodes': self._export_nodes(),
+            'edges': self._export_edges(),
+            'metrics': {
+                'node_count': self.graph.number_of_nodes(),
+                'edge_count': self.graph.number_of_edges(),
+                'density': nx.density(self.graph),
+                'is_connected': nx.is_weakly_connected(self.graph),
+                'average_degree': sum(dict(self.graph.degree()).values()) / self.graph.number_of_nodes() if self.graph.number_of_nodes() > 0 else 0,
+                'clustering_coefficient': nx.average_clustering(self.graph.to_undirected()),
+                'communities': len(self.communities)
+            },
+            'communities': self._export_communities(),
+            'centrality': self.centrality_scores,
+            'critical_paths': critical_paths,
+            'hierarchy': hierarchy
         }
         
-        for pattern_name, pattern_regex in patterns.items():
-            try:
-                matches = sum(1 for v in str_values if re.match(pattern_regex, v))
-                features.append(matches / max(len(str_values), 1))
-            except:
-                features.append(0)
+        logger.info(f"✅ Graph built with {graph_data['metrics']['node_count']} nodes and {graph_data['metrics']['edge_count']} edges")
         
-        # Character class features
-        char_features = self._extract_char_class_features(str_values)
-        features.extend(char_features)
-        
-        return features[:100]
+        return graph_data
     
-    def _extract_char_class_features(self, values: List[str]) -> List[float]:
-        features = []
+    def _add_host_node(self, host: Dict):
+        """Add host as node in graph"""
+        node_id = host.get('hostname', 'unknown')
         
-        all_text = ''.join(values[:100])  # Limit for performance
-        if not all_text:
-            return [0] * 20
+        # Node attributes
+        attributes = {
+            'type': host.get('classification', {}).get('type', 'unknown'),
+            'sub_type': host.get('classification', {}).get('sub_type', 'unknown'),
+            'environment': host.get('environment', 'unknown'),
+            'datacenter': host.get('datacenter', 'unknown'),
+            'application': host.get('application', 'unknown'),
+            'owner': host.get('owner', 'unknown'),
+            'confidence': host.get('confidence', 0.0),
+            'quality_score': host.get('quality_score', 0.0),
+            'criticality': host.get('criticality', 'medium'),
+            'tags': host.get('classification', {}).get('tags', [])
+        }
         
-        total_chars = len(all_text)
+        # Add additional attributes
+        for key, value in host.items():
+            if key not in attributes and not isinstance(value, (dict, list)):
+                attributes[key] = value
         
-        features.append(sum(c.isalpha() for c in all_text) / total_chars)
-        features.append(sum(c.isdigit() for c in all_text) / total_chars)
-        features.append(sum(c.isspace() for c in all_text) / total_chars)
-        features.append(sum(c.isupper() for c in all_text) / total_chars)
-        features.append(sum(c.islower() for c in all_text) / total_chars)
-        features.append(sum(c in '.-_' for c in all_text) / total_chars)
-        features.append(sum(c in '@#$%' for c in all_text) / total_chars)
-        features.append(sum(c in '()[]{}' for c in all_text) / total_chars)
-        features.append(sum(c in '/\\|' for c in all_text) / total_chars)
-        features.append(sum(c in ',:;' for c in all_text) / total_chars)
-        
-        # Non-ASCII
-        features.append(sum(ord(c) > 127 for c in all_text) / total_chars)
-        
-        # Entropy
-        char_entropy = self._calculate_entropy(all_text)
-        features.append(char_entropy)
-        
-        # Bigram entropy
-        bigram_entropy = self._calculate_bigram_entropy(all_text)
-        features.append(bigram_entropy)
-        
-        # Pad to 20
-        while len(features) < 20:
-            features.append(0)
-        
-        return features[:20]
+        self.graph.add_node(node_id, **attributes)
     
-    def _extract_semantic_features(self, column_name: str, values: List[Any]) -> List[float]:
-        features = []
+    def _add_relationship_edge(self, relationship: Dict):
+        """Add relationship as edge in graph"""
+        source = relationship.get('source')
+        target = relationship.get('target')
         
-        name_lower = column_name.lower()
+        if not source or not target:
+            return
         
-        # Semantic indicators
-        semantic_indicators = [
-            'id', 'name', 'email', 'phone', 'address', 'date', 'time',
-            'amount', 'price', 'cost', 'value', 'count', 'number',
-            'host', 'server', 'ip', 'domain', 'url', 'path',
-            'user', 'customer', 'client', 'owner', 'created', 'modified'
-        ]
+        # Ensure nodes exist
+        if source not in self.graph:
+            self.graph.add_node(source)
+        if target not in self.graph:
+            self.graph.add_node(target)
         
-        for indicator in semantic_indicators:
-            features.append(float(indicator in name_lower))
+        # Edge attributes
+        attributes = {
+            'type': relationship.get('type', 'related'),
+            'confidence': relationship.get('confidence', 0.5),
+            'via_attribute': relationship.get('via_attribute'),
+            'discovered_at': relationship.get('discovered_at'),
+            'metadata': relationship.get('metadata', {})
+        }
         
-        # Column name structure
-        features.append(len(column_name))
-        features.append(column_name.count('_'))
-        features.append(float(column_name.isupper()))
-        features.append(float(column_name.islower()))
-        
-        # Pad to 100
-        while len(features) < 100:
-            features.append(0)
-        
-        return features[:100]
+        self.graph.add_edge(source, target, **attributes)
     
-    def _extract_distribution_features(self, values: List[Any]) -> List[float]:
-        features = []
+    def _calculate_metrics(self):
+        """Calculate graph metrics and centrality"""
+        if self.graph.number_of_nodes() == 0:
+            return
         
-        str_values = [str(v) if v is not None else '' for v in values]
+        # Degree centrality
+        self.centrality_scores['degree'] = nx.degree_centrality(self.graph)
         
-        if not str_values:
-            return [0] * 50
+        # Betweenness centrality (important for finding critical nodes)
+        if self.graph.number_of_nodes() < 1000:  # Expensive for large graphs
+            self.centrality_scores['betweenness'] = nx.betweenness_centrality(self.graph)
         
-        value_counts = Counter(str_values)
-        frequencies = list(value_counts.values())
+        # Closeness centrality
+        if nx.is_weakly_connected(self.graph):
+            self.centrality_scores['closeness'] = nx.closeness_centrality(self.graph)
         
-        if frequencies:
-            features.append(max(frequencies))
-            features.append(min(frequencies))
-            features.append(np.mean(frequencies))
-            features.append(np.std(frequencies) if len(frequencies) > 1 else 0)
+        # PageRank (importance based on connections)
+        self.centrality_scores['pagerank'] = nx.pagerank(self.graph)
+        
+        # Identify critical nodes (high centrality)
+        critical_nodes = []
+        for node in self.graph.nodes():
+            score = 0
+            for metric in ['degree', 'betweenness', 'pagerank']:
+                if metric in self.centrality_scores:
+                    score += self.centrality_scores[metric].get(node, 0)
             
-            # Top 10 frequency
-            top_10_freq = sum(sorted(frequencies, reverse=True)[:10])
-            features.append(top_10_freq / sum(frequencies))
+            if score > 0.5:  # Threshold for critical nodes
+                critical_nodes.append(node)
+        
+        self.centrality_scores['critical_nodes'] = critical_nodes[:20]  # Top 20
+    
+    def _detect_communities(self):
+        """Detect communities in the graph"""
+        if self.graph.number_of_nodes() < 2:
+            return
+        
+        # Convert to undirected for community detection
+        undirected_graph = self.graph.to_undirected()
+        
+        try:
+            # Use Louvain community detection
+            import community as community_louvain
+            partition = community_louvain.best_partition(undirected_graph)
             
-            # Gini coefficient
-            gini = self._calculate_gini_coefficient(frequencies)
-            features.append(gini)
+            # Group nodes by community
+            communities = defaultdict(list)
+            for node, comm_id in partition.items():
+                communities[comm_id].append(node)
+            
+            self.communities = list(communities.values())
+            
+        except ImportError:
+            # Fallback to connected components
+            self.communities = list(nx.weakly_connected_components(self.graph))
+        
+        logger.info(f"Detected {len(self.communities)} communities")
+    
+    def _find_critical_paths(self) -> List[Dict]:
+        """Find critical paths in the infrastructure"""
+        critical_paths = []
+        
+        # Find paths between critical nodes
+        critical_nodes = self.centrality_scores.get('critical_nodes', [])
+        
+        for i, source in enumerate(critical_nodes[:5]):  # Limit for performance
+            for target in critical_nodes[i+1:6]:
+                try:
+                    # Find shortest path
+                    path = nx.shortest_path(self.graph, source, target)
+                    
+                    if len(path) > 2:  # Non-trivial paths
+                        critical_paths.append({
+                            'source': source,
+                            'target': target,
+                            'path': path,
+                            'length': len(path),
+                            'type': 'shortest'
+                        })
+                except nx.NetworkXNoPath:
+                    continue
+        
+        # Find single points of failure
+        articulation_points = []
+        if self.graph.number_of_nodes() < 1000:  # Expensive
+            undirected = self.graph.to_undirected()
+            articulation_points = list(nx.articulation_points(undirected))
+        
+        if articulation_points:
+            critical_paths.append({
+                'type': 'single_points_of_failure',
+                'nodes': articulation_points[:10],
+                'impact': 'Removing these nodes would disconnect the graph'
+            })
+        
+        return critical_paths
+    
+    async def _generate_embeddings(self):
+        """Generate node and edge embeddings"""
+        if self.graph.number_of_nodes() == 0:
+            return
+        
+        # Simple node2vec style embeddings
+        try:
+            from node2vec import Node2Vec
+            
+            # Generate walks
+            node2vec = Node2Vec(
+                self.graph,
+                dimensions=64,
+                walk_length=10,
+                num_walks=80,
+                workers=4
+            )
+            
+            # Learn embeddings
+            model = node2vec.fit(window=10, min_count=1, batch_words=4)
+            
+            # Store embeddings
+            for node in self.graph.nodes():
+                if node in model.wv:
+                    self.node_embeddings[node] = model.wv[node]
+                    
+        except ImportError:
+            # Fallback to simple feature-based embeddings
+            for node in self.graph.nodes():
+                features = []
+                node_data = self.graph.nodes[node]
+                
+                # Encode categorical features
+                features.append(hash(node_data.get('type', '')) % 1000 / 1000)
+                features.append(hash(node_data.get('environment', '')) % 1000 / 1000)
+                features.append(hash(node_data.get('datacenter', '')) % 1000 / 1000)
+                features.append(node_data.get('confidence', 0))
+                features.append(self.graph.degree(node) / 100)
+                
+                # Pad to fixed size
+                while len(features) < 64:
+                    features.append(0)
+                
+                self.node_embeddings[node] = np.array(features[:64])
+    
+    def _build_hierarchy(self) -> Dict:
+        """Build hierarchical structure of infrastructure"""
+        hierarchy = {
+            'environments': defaultdict(lambda: {
+                'datacenters': defaultdict(lambda: {
+                    'applications': defaultdict(list)
+                })
+            })
+        }
+        
+        for node in self.graph.nodes():
+            node_data = self.graph.nodes[node]
+            env = node_data.get('environment', 'unknown')
+            dc = node_data.get('datacenter', 'unknown')
+            app = node_data.get('application', 'unknown')
+            
+            hierarchy['environments'][env]['datacenters'][dc]['applications'][app].append(node)
+        
+        # Convert defaultdicts to regular dicts for JSON serialization
+        return json.loads(json.dumps(hierarchy, default=str))
+    
+    def _export_nodes(self) -> List[Dict]:
+        """Export nodes with attributes"""
+        nodes = []
+        
+        for node_id in self.graph.nodes():
+            node_data = dict(self.graph.nodes[node_id])
+            node_data['id'] = node_id
+            node_data['degree'] = self.graph.degree(node_id)
+            
+            # Add centrality scores
+            for metric in ['degree', 'betweenness', 'closeness', 'pagerank']:
+                if metric in self.centrality_scores:
+                    node_data[f'centrality_{metric}'] = self.centrality_scores[metric].get(node_id, 0)
+            
+            # Add embedding if available
+            if node_id in self.node_embeddings:
+                node_data['has_embedding'] = True
+                # Don't include full embedding in export (too large)
+            
+            nodes.append(node_data)
+        
+        return nodes
+    
+    def _export_edges(self) -> List[Dict]:
+        """Export edges with attributes"""
+        edges = []
+        
+        for source, target, data in self.graph.edges(data=True):
+            edge_data = dict(data)
+            edge_data['source'] = source
+            edge_data['target'] = target
+            edges.append(edge_data)
+        
+        return edges
+    
+    def _export_communities(self) -> List[Dict]:
+        """Export detected communities"""
+        communities = []
+        
+        for i, community_nodes in enumerate(self.communities):
+            # Calculate community statistics
+            subgraph = self.graph.subgraph(community_nodes)
+            
+            community_data = {
+                'id': i,
+                'size': len(community_nodes),
+                'nodes': list(community_nodes)[:20],  # Sample for large communities
+                'density': nx.density(subgraph) if len(community_nodes) > 1 else 0,
+                'internal_edges': subgraph.number_of_edges()
+            }
+            
+            # Determine community type based on common attributes
+            node_types = Counter()
+            environments = Counter()
+            applications = Counter()
+            
+            for node in community_nodes[:50]:  # Sample
+                if node in self.graph:
+                    node_data = self.graph.nodes[node]
+                    node_types[node_data.get('type', 'unknown')] += 1
+                    environments[node_data.get('environment', 'unknown')] += 1
+                    applications[node_data.get('application', 'unknown')] += 1
+            
+            # Most common attributes
+            if node_types:
+                community_data['primary_type'] = node_types.most_common(1)[0][0]
+            if environments:
+                community_data['primary_environment'] = environments.most_common(1)[0][0]
+            if applications:
+                community_data['primary_application'] = applications.most_common(1)[0][0]
+            
+            communities.append(community_data)
+        
+        return communities
+    
+    def find_dependencies(self, node_id: str, depth: int = 2) -> Dict:
+        """Find dependencies for a specific node"""
+        if node_id not in self.graph:
+            return {}
+        
+        dependencies = {
+            'upstream': [],
+            'downstream': []
+        }
+        
+        # Find upstream dependencies (nodes this node depends on)
+        for predecessor in self.graph.predecessors(node_id):
+            edge_data = self.graph.edges[predecessor, node_id]
+            dependencies['upstream'].append({
+                'node': predecessor,
+                'relationship': edge_data.get('type', 'unknown'),
+                'confidence': edge_data.get('confidence', 0)
+            })
+        
+        # Find downstream dependencies (nodes that depend on this node)
+        for successor in self.graph.successors(node_id):
+            edge_data = self.graph.edges[node_id, successor]
+            dependencies['downstream'].append({
+                'node': successor,
+                'relationship': edge_data.get('type', 'unknown'),
+                'confidence': edge_data.get('confidence', 0)
+            })
+        
+        # Find multi-hop dependencies if requested
+        if depth > 1:
+            dependencies['multi_hop_upstream'] = []
+            dependencies['multi_hop_downstream'] = []
+            
+            # BFS for multi-hop
+            visited = {node_id}
+            queue = [(node_id, 0)]
+            
+            while queue:
+                current, current_depth = queue.pop(0)
+                
+                if current_depth < depth:
+                    # Upstream
+                    for pred in self.graph.predecessors(current):
+                        if pred not in visited:
+                            visited.add(pred)
+                            queue.append((pred, current_depth + 1))
+                            if current != node_id:
+                                dependencies['multi_hop_upstream'].append({
+                                    'node': pred,
+                                    'hops': current_depth + 1
+                                })
+        
+        return dependencies
+    
+    def get_impact_analysis(self, node_id: str) -> Dict:
+        """Analyze impact of node failure"""
+        if node_id not in self.graph:
+            return {}
+        
+        impact = {
+            'direct_impact': [],
+            'total_affected': 0,
+            'critical_paths_affected': 0,
+            'communities_affected': []
+        }
+        
+        # Find directly connected nodes
+        impact['direct_impact'] = list(self.graph.neighbors(node_id))
+        
+        # Find all reachable nodes
+        reachable = nx.descendants(self.graph, node_id)
+        impact['total_affected'] = len(reachable)
+        
+        # Check critical paths
+        for path_info in self.centrality_scores.get('critical_paths', []):
+            if node_id in path_info.get('path', []):
+                impact['critical_paths_affected'] += 1
+        
+        # Check communities
+        for i, community in enumerate(self.communities):
+            if node_id in community:
+                impact['communities_affected'].append(i)
+        
+        return impact
+    
+    def find_similar_nodes(self, node_id: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """Find similar nodes based on attributes and embeddings"""
+        if node_id not in self.graph:
+            return []
+        
+        similar_nodes = []
+        source_data = self.graph.nodes[node_id]
+        source_embedding = self.node_embeddings.get(node_id)
+        
+        for other_node in self.graph.nodes():
+            if other_node == node_id:
+                continue
+            
+            similarity_score = 0.0
+            other_data = self.graph.nodes[other_node]
+            
+            # Attribute similarity
+            if source_data.get('type') == other_data.get('type'):
+                similarity_score += 0.3
+            if source_data.get('environment') == other_data.get('environment'):
+                similarity_score += 0.2
+            if source_data.get('datacenter') == other_data.get('datacenter'):
+                similarity_score += 0.1
+            if source_data.get('application') == other_data.get('application'):
+                similarity_score += 0.2
+            
+            # Embedding similarity
+            if source_embedding is not None and other_node in self.node_embeddings:
+                other_embedding = self.node_embeddings[other_node]
+                # Cosine similarity
+                cosine_sim = np.dot(source_embedding, other_embedding) / (
+                    np.linalg.norm(source_embedding) * np.linalg.norm(other_embedding)
+                )
+                similarity_score += cosine_sim * 0.2
+            
+            similar_nodes.append((other_node, similarity_score))
+        
+        # Sort by similarity and return top k
+        similar_nodes.sort(key=lambda x: x[1], reverse=True)
+        return similar_nodes[:top_k]
+    
+    def get_subgraph(self, nodes: List[str], include_edges: bool = True) -> nx.MultiDiGraph:
+        """Get subgraph containing specified nodes"""
+        if include_edges:
+            return self.graph.subgraph(nodes).copy()
         else:
-            features.extend([0] * 6)
-        
-        # Length distribution
-        lengths = [len(v) for v in str_values]
-        if lengths:
-            length_counts = Counter(lengths)
-            length_entropy = self._calculate_entropy_from_counts(length_counts)
-            features.append(length_entropy)
-            features.append(0)  # Placeholder for normality test
-        else:
-            features.extend([0, 0])
-        
-        # Pad to 50
-        while len(features) < 50:
-            features.append(0)
-        
-        return features[:50]
+            # Create subgraph without edges between nodes
+            subgraph = nx.MultiDiGraph()
+            for node in nodes:
+                if node in self.graph:
+                    subgraph.add_node(node, **self.graph.nodes[node])
+            return subgraph
     
-    def _extract_embedding_features(self, column_name: str, values: List[Any]) -> np.ndarray:
-        """Extract embedding using simple embedder"""
-        sample_text = f"{column_name} " + " ".join([str(v) for v in values[:20] if v])
-        
-        with torch.no_grad():
-            embedding = self.embedder(sample_text)
-        
-        # Ensure we return exactly 384 features
-        embedding_array = embedding.cpu().numpy().flatten()
-        if len(embedding_array) < 384:
-            embedding_array = np.pad(embedding_array, (0, 384 - len(embedding_array)), mode='constant')
-        
-        return embedding_array[:384]
+    def find_shortest_path(self, source: str, target: str) -> Optional[List[str]]:
+        """Find shortest path between two nodes"""
+        try:
+            return nx.shortest_path(self.graph, source, target)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
     
-    def _calculate_entropy(self, text: str) -> float:
-        if not text:
-            return 0
+    def get_node_statistics(self) -> Dict:
+        """Get overall statistics about nodes in the graph"""
+        stats = {
+            'total_nodes': self.graph.number_of_nodes(),
+            'total_edges': self.graph.number_of_edges(),
+            'node_types': Counter(),
+            'environments': Counter(),
+            'datacenters': Counter(),
+            'applications': Counter(),
+            'criticality_levels': Counter(),
+            'average_degree': 0,
+            'max_degree': 0,
+            'min_degree': 0,
+            'isolated_nodes': 0
+        }
         
-        char_counts = Counter(text)
-        total = len(text)
-        entropy = -sum((count/total) * np.log2(count/total) for count in char_counts.values())
+        degrees = []
+        for node in self.graph.nodes():
+            node_data = self.graph.nodes[node]
+            degree = self.graph.degree(node)
+            degrees.append(degree)
+            
+            # Count attributes
+            stats['node_types'][node_data.get('type', 'unknown')] += 1
+            stats['environments'][node_data.get('environment', 'unknown')] += 1
+            stats['datacenters'][node_data.get('datacenter', 'unknown')] += 1
+            stats['applications'][node_data.get('application', 'unknown')] += 1
+            stats['criticality_levels'][node_data.get('criticality', 'medium')] += 1
+            
+            if degree == 0:
+                stats['isolated_nodes'] += 1
         
-        return entropy
+        if degrees:
+            stats['average_degree'] = sum(degrees) / len(degrees)
+            stats['max_degree'] = max(degrees)
+            stats['min_degree'] = min(degrees)
+        
+        # Convert Counters to dicts for JSON serialization
+        stats['node_types'] = dict(stats['node_types'])
+        stats['environments'] = dict(stats['environments'])
+        stats['datacenters'] = dict(stats['datacenters'])
+        stats['applications'] = dict(stats['applications'])
+        stats['criticality_levels'] = dict(stats['criticality_levels'])
+        
+        return stats
     
-    def _calculate_bigram_entropy(self, text: str) -> float:
-        if len(text) < 2:
-            return 0
-        
-        bigrams = [text[i:i+2] for i in range(len(text)-1)]
-        bigram_counts = Counter(bigrams)
-        total = len(bigrams)
-        
-        entropy = -sum((count/total) * np.log2(count/total) for count in bigram_counts.values())
-        
-        return entropy
+    def export_to_graphml(self, filepath: str):
+        """Export graph to GraphML format for visualization"""
+        nx.write_graphml(self.graph, filepath)
+        logger.info(f"Graph exported to {filepath}")
     
-    def _calculate_entropy_from_counts(self, counts: Counter) -> float:
-        total = sum(counts.values())
-        if total == 0:
-            return 0
+    def export_to_cytoscape(self) -> Dict:
+        """Export graph in Cytoscape.js format"""
+        elements = {
+            'nodes': [],
+            'edges': []
+        }
         
-        entropy = -sum((count/total) * np.log2(count/total) for count in counts.values() if count > 0)
+        # Export nodes
+        for node_id in self.graph.nodes():
+            node_data = self.graph.nodes[node_id]
+            elements['nodes'].append({
+                'data': {
+                    'id': node_id,
+                    'label': node_id,
+                    **{k: v for k, v in node_data.items() if not isinstance(v, (list, dict))}
+                }
+            })
         
-        return entropy
-    
-    def _calculate_gini_coefficient(self, values: List[float]) -> float:
-        sorted_values = sorted(values)
-        n = len(sorted_values)
+        # Export edges
+        for source, target, data in self.graph.edges(data=True):
+            elements['edges'].append({
+                'data': {
+                    'id': f"{source}-{target}",
+                    'source': source,
+                    'target': target,
+                    'label': data.get('type', 'related'),
+                    **{k: v for k, v in data.items() if not isinstance(v, (list, dict))}
+                }
+            })
         
-        if n == 0 or sum(sorted_values) == 0:
-            return 0
-        
-        cumsum = np.cumsum(sorted_values)
-        gini = (2 * np.sum((np.arange(n) + 1) * sorted_values)) / (n * cumsum[-1]) - (n + 1) / n
-        
-        return gini
-    
-    def _get_cache_key(self, column_name: str, values: List[Any]) -> str:
-        value_str = str(values[:5])
-        key_str = f"{column_name}:{value_str}"
-        return hashlib.md5(key_str.encode()).hexdigest()
+        return elements

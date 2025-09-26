@@ -9,7 +9,13 @@
     "tables_filter": [],
     "sample_percent": 10,
     "max_rows_per_table": 100000,
-    "timeout_seconds": 60
+    "timeout_seconds": 60,
+    "scan_all_datasets": true,
+    "scan_all_tables": true,
+    "learn_patterns": true,
+    "adaptive_sampling": true,
+    "parallel_scanning": true,
+    "max_workers": 4
   },
   "discovery": {
     "hostname_patterns": [
@@ -78,30 +84,98 @@
       {"column_pattern": ".*gcp.*project.*", "confidence": 0.95},
       {"column_pattern": ".*aws.*account.*", "confidence": 0.9},
       {"column_pattern": ".*azure.*subscription.*", "confidence": 0.9}
-    ]
+    ],
+    "enable_pattern_learning": true,
+    "find_associated_columns": true,
+    "association_threshold": 0.7,
+    "pattern_confidence_threshold": 0.6
+  },
+  "ml_models": {
+    "enable_ensemble": true,
+    "models": ["sherlock", "sato", "doduo", "llm"],
+    "ensemble_weights": {
+      "sherlock": 0.25,
+      "sato": 0.30,
+      "doduo": 0.35,
+      "llm": 0.10
+    },
+    "device": "auto",
+    "batch_size": 128,
+    "cache_embeddings": true
+  },
+  "entity_resolution": {
+    "enabled": true,
+    "comparison_threshold": 0.7,
+    "confidence_levels": [0.8, 0.9, 0.95],
+    "use_ml": true,
+    "deduplicate_across_tables": true,
+    "merge_strategy": "highest_quality"
   },
   "output_database": "bigquery_cmdb.db",
   "checkpoint": {
     "enabled": true,
     "checkpoint_dir": "checkpoints",
-    "checkpoint_interval": 1000
+    "checkpoint_interval": 1000,
+    "resume_on_failure": true
+  },
+  "storage": {
+    "elasticsearch": {
+      "enabled": false,
+      "url": "http://localhost:9200",
+      "index": "cmdb"
+    },
+    "neo4j": {
+      "enabled": false,
+      "uri": "bolt://localhost:7687",
+      "user": "neo4j",
+      "password": ""
+    },
+    "kafka_brokers": [],
+    "enable_streaming": false
   },
   "export": {
     "csv": true,
     "json": true,
-    "parquet": false,
-    "output_dir": "output"
+    "parquet": true,
+    "output_dir": "output",
+    "include_patterns": true,
+    "include_graph": true,
+    "include_quality_report": true
   },
   "logging": {
     "level": "INFO",
     "file": "logs/bigquery_cmdb.log",
     "console": true,
-    "format": "detailed"
+    "format": "detailed",
+    "performance_tracking": true
   },
   "performance": {
     "max_workers": 4,
     "batch_size": 100,
     "enable_caching": true,
-    "cache_ttl_seconds": 3600
+    "cache_ttl_seconds": 3600,
+    "memory_limit": "8GB",
+    "enable_gpu": true
+  },
+  "quality": {
+    "enable_quality_checks": true,
+    "anomaly_detection": true,
+    "insight_generation": true,
+    "quality_threshold": 0.7,
+    "completeness_check": true,
+    "consistency_check": true
+  },
+  "advanced": {
+    "build_knowledge_graph": true,
+    "detect_communities": true,
+    "find_critical_paths": true,
+    "impact_analysis": true,
+    "generate_embeddings": true,
+    "adaptive_learning": {
+      "enabled": true,
+      "update_patterns": true,
+      "confidence_decay": 0.95,
+      "min_samples": 10
+    }
   }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BigQuery CMDB Discovery System
-Scans BigQuery projects to automatically discover and build a CMDB of your infrastructure
+Enhanced BigQuery CMDB Discovery System
+Scans ALL BigQuery projects, datasets, and tables to build comprehensive CMDB
 """
 
 import asyncio
@@ -12,22 +12,89 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List
+import torch
 
+# Core components
 from core.bigquery_scanner import BigQueryScanner
 from core.cmdb_discovery import CMDBDiscovery
 from core.cmdb_builder import CMDBBuilder
-from utils.logger import setup_logging
+from core.classifier import IntelligentClassifier
+from core.relationship_mapper import RelationshipMapper
+from core.quality_analyzer import QualityAnalyzer
+from core.config_manager import ConfigManager
+from core.checkpoint_manager import CheckpointManager
+from core.orchestrator import DiscoveryOrchestrator
+
+# ML Models
+from models.ensemble_predictor import EnsemblePredictor
+from models.sherlock_model import SherlockModel
+from models.sato_model import SatoModel
+from models.doduo_model import DoduoModel
+from models.llm_classifier import LLMClassifier
+
+# Processors
+from processors.feature_extractor import AdvancedFeatureExtractor
+from processors.entity_resolver import EntityResolver
+from processors.context_analyzer import ContextAnalyzer
+from processors.graph_builder import GraphBuilder
+
+# Storage
+from storage.metadata_store import MetadataStore
+from storage.streaming_handler import StreamingHandler
+
+# Utils
+from utils.logger import setup_logging, PerformanceLogger
+from utils.gpu_optimizer import GPUOptimizer
+from utils.data_loader import FastTabularDataLoader, CachedDataLoader
 
 logger = setup_logging('bigquery_cmdb')
 
-class BigQueryCMDBSystem:
-    """Main system to scan BigQuery and build CMDB"""
+class EnhancedBigQueryCMDBSystem:
+    """Enhanced system that uses ALL components to scan BigQuery comprehensively"""
     
     def __init__(self, config_path: str = 'config.json'):
-        self.config = self.load_config(config_path)
+        # Load and validate configuration
+        self.config_manager = ConfigManager(config_path)
+        self.config = self.config_manager.load_config()
+        
+        # Initialize GPU if available (Mac MPS)
+        self.device = self._initialize_device()
+        
+        # Initialize core components
         self.scanner = BigQueryScanner(self.config)
         self.discovery = CMDBDiscovery(self.config)
-        self.builder = CMDBBuilder(self.config.get('output_database', 'cmdb.db'))
+        self.classifier = IntelligentClassifier()
+        self.relationship_mapper = RelationshipMapper()
+        self.quality_analyzer = QualityAnalyzer()
+        
+        # Initialize ML models
+        self._initialize_ml_models()
+        
+        # Initialize processors
+        self.feature_extractor = AdvancedFeatureExtractor(self.device)
+        self.entity_resolver = EntityResolver(self.config, self.device)
+        self.context_analyzer = ContextAnalyzer(self.device)
+        self.graph_builder = GraphBuilder(self.config)
+        
+        # Initialize storage
+        self.builder = CMDBBuilder(self.config.get('output_database', 'bigquery_cmdb.db'))
+        self.metadata_store = MetadataStore(self.config)
+        self.streaming_handler = StreamingHandler(self.config)
+        
+        # Initialize checkpoint manager
+        self.checkpoint_manager = CheckpointManager()
+        
+        # Data loaders for efficient processing
+        self.data_loader = FastTabularDataLoader(device=self.device)
+        self.cache_loader = CachedDataLoader()
+        
+        # Performance tracking
+        self.perf_logger = PerformanceLogger('performance')
+        
+        # Discovery orchestrator for complex workflows
+        self.orchestrator = DiscoveryOrchestrator(self.config)
+        
+        # Statistics
         self.stats = {
             'start_time': datetime.now(),
             'projects_scanned': 0,
@@ -35,197 +102,633 @@ class BigQueryCMDBSystem:
             'tables_scanned': 0,
             'rows_processed': 0,
             'hosts_discovered': 0,
-            'relationships_found': 0
+            'unique_hosts': 0,
+            'relationships_found': 0,
+            'columns_classified': 0,
+            'hostname_patterns_learned': 0
         }
+        
+        # Learned patterns storage
+        self.learned_hostname_patterns = []
+        self.associated_columns = {}
+        
+    def _initialize_device(self) -> str:
+        """Initialize GPU/MPS if available"""
+        try:
+            gpu_optimizer = GPUOptimizer()
+            device = gpu_optimizer.initialize()
+            logger.info(f"✅ GPU initialized: {device}")
+            return device
+        except Exception as e:
+            logger.info(f"GPU not available, using CPU: {e}")
+            return 'cpu'
     
-    def load_config(self, config_path: str) -> Dict:
-        """Load configuration"""
-        path = Path(config_path)
-        if not path.exists():
-            logger.error(f"Config file not found: {config_path}")
-            self.create_default_config(path)
-            logger.info(f"Created default config at {config_path}")
-            logger.info("Please edit it with your BigQuery projects and credentials")
-            sys.exit(1)
-        
-        with open(path) as f:
-            config = json.load(f)
-        
-        # Validate BigQuery configuration
-        if not config.get('bigquery', {}).get('projects'):
-            logger.error("No BigQuery projects configured!")
-            logger.error("Edit config.json and add your project IDs under 'bigquery.projects'")
-            sys.exit(1)
-        
-        return config
-    
-    def create_default_config(self, path: Path):
-        """Create default configuration for BigQuery scanning"""
-        config = {
-            "bigquery": {
-                "projects": ["your-project-id-1", "your-project-id-2"],
-                "credentials_path": "gcp_credentials.json",
-                "datasets_filter": [],  # Leave empty to scan all datasets
-                "tables_filter": [],    # Leave empty to scan all tables
-                "sample_percent": 10,   # Sample 10% of large tables
-                "max_rows_per_table": 100000
+    def _initialize_ml_models(self):
+        """Initialize all ML models for column classification"""
+        model_config = {
+            'model_config': {
+                'sherlock_features': 1588,
+                'sato_topics': 400,
+                'llm_model': 'rule-based',
+                'llm_batch_size': 50,
+                'weak_supervision_ratio': 0.013
             },
-            "discovery": {
-                "hostname_patterns": [
-                    {"column_pattern": ".*host.*", "confidence": 0.9},
-                    {"column_pattern": ".*server.*", "confidence": 0.8},
-                    {"column_pattern": ".*instance.*", "confidence": 0.8},
-                    {"column_pattern": ".*node.*", "confidence": 0.7},
-                    {"column_pattern": ".*machine.*", "confidence": 0.7},
-                    {"column_pattern": ".*device.*", "confidence": 0.6}
-                ],
-                "ip_patterns": [
-                    {"column_pattern": ".*ip.*address.*", "confidence": 0.95},
-                    {"column_pattern": ".*ip.*", "confidence": 0.8},
-                    {"column_pattern": ".*addr.*", "confidence": 0.6}
-                ],
-                "environment_patterns": [
-                    {"column_pattern": ".*env.*", "confidence": 0.9},
-                    {"column_pattern": ".*environment.*", "confidence": 0.95},
-                    {"column_pattern": ".*stage.*", "confidence": 0.7}
-                ],
-                "application_patterns": [
-                    {"column_pattern": ".*app.*", "confidence": 0.8},
-                    {"column_pattern": ".*service.*", "confidence": 0.8},
-                    {"column_pattern": ".*application.*", "confidence": 0.9}
-                ]
-            },
-            "output_database": "bigquery_cmdb.db",
-            "export": {
-                "csv": true,
-                "json": true,
-                "output_dir": "output"
-            },
-            "logging": {
-                "level": "INFO",
-                "file": "logs/bigquery_cmdb.log"
+            'entity_resolution': {
+                'comparison_threshold': 0.7,
+                'confidence_levels': [0.8, 0.9, 0.95]
             }
         }
         
-        with open(path, 'w') as f:
-            json.dump(config, f, indent=2)
+        self.ensemble_predictor = EnsemblePredictor(model_config, self.device)
+        logger.info("✅ ML models initialized")
     
     async def run(self):
-        """Main execution"""
-        logger.info("="*60)
-        logger.info("BigQuery CMDB Discovery System")
-        logger.info("="*60)
+        """Main execution with comprehensive scanning"""
+        logger.info("="*80)
+        logger.info("🚀 ENHANCED BIGQUERY CMDB DISCOVERY SYSTEM")
+        logger.info("="*80)
         
-        # Step 1: Scan BigQuery
-        logger.info("\n📊 Step 1: Scanning BigQuery projects...")
-        bigquery_data = await self.scanner.scan_all_projects()
+        # Check for checkpoint
+        if self.checkpoint_manager.load():
+            logger.info("📥 Resuming from checkpoint...")
+            state = self.checkpoint_manager.load()
+            if state:
+                self.stats.update(state.get('statistics', {}))
+                self.learned_hostname_patterns = state.get('patterns', [])
         
-        if not bigquery_data:
-            logger.error("No data found in BigQuery! Check your configuration and credentials.")
+        try:
+            # Step 1: Comprehensive BigQuery Scanning
+            logger.info("\n📊 Step 1: Scanning ALL BigQuery projects, datasets, and tables...")
+            bigquery_data = await self._comprehensive_scan()
+            
+            # Step 2: ML-based Column Classification
+            logger.info("\n🤖 Step 2: Classifying columns using ML ensemble...")
+            column_classifications = await self._classify_all_columns(bigquery_data)
+            
+            # Step 3: Pattern Learning
+            logger.info("\n🧠 Step 3: Learning hostname patterns from discovered data...")
+            await self._learn_hostname_patterns(bigquery_data, column_classifications)
+            
+            # Step 4: Comprehensive Host Discovery
+            logger.info("\n🔍 Step 4: Discovering ALL hosts using learned patterns...")
+            discovered_hosts = await self._discover_all_hosts(bigquery_data, column_classifications)
+            
+            # Step 5: Entity Resolution
+            logger.info("\n🔗 Step 5: Resolving and deduplicating entities...")
+            resolved_hosts = await self._resolve_entities(discovered_hosts)
+            
+            # Step 6: Context Enrichment
+            logger.info("\n✨ Step 6: Enriching hosts with context...")
+            enriched_hosts = await self._enrich_hosts(resolved_hosts, column_classifications)
+            
+            # Step 7: Relationship Discovery
+            logger.info("\n🕸️ Step 7: Discovering relationships...")
+            relationships = await self._discover_relationships(enriched_hosts)
+            
+            # Step 8: Quality Analysis
+            logger.info("\n📈 Step 8: Analyzing data quality...")
+            quality_report = await self._analyze_quality(enriched_hosts, relationships)
+            
+            # Step 9: Build Knowledge Graph
+            logger.info("\n🌐 Step 9: Building knowledge graph...")
+            graph = await self._build_graph(enriched_hosts, relationships)
+            
+            # Step 10: Build Final CMDB
+            logger.info("\n🏗️ Step 10: Building comprehensive CMDB...")
+            await self._build_final_cmdb(enriched_hosts, relationships, graph)
+            
+            # Step 11: Stream Results (if Kafka configured)
+            logger.info("\n📡 Step 11: Streaming results...")
+            await self._stream_results(enriched_hosts, relationships)
+            
+            # Step 12: Export Results
+            logger.info("\n📁 Step 12: Exporting results...")
+            await self._export_results(enriched_hosts, relationships, quality_report)
+            
+            # Save checkpoint
+            self._save_checkpoint(enriched_hosts)
+            
+            # Print comprehensive summary
+            self._print_comprehensive_summary(quality_report)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Discovery failed: {e}", exc_info=True)
+            self._save_checkpoint(None)
             return False
+    
+    async def _comprehensive_scan(self) -> List[Dict]:
+        """Scan ALL BigQuery projects, datasets, and tables"""
+        all_data = []
         
-        self.stats['projects_scanned'] = len(self.scanner.projects_scanned)
-        self.stats['datasets_scanned'] = self.scanner.datasets_scanned
-        self.stats['tables_scanned'] = self.scanner.tables_scanned
-        self.stats['rows_processed'] = self.scanner.rows_processed
+        # Ensure no filtering
+        self.scanner.datasets_filter = set()  # Empty = scan all
+        self.scanner.tables_filter = set()    # Empty = scan all
         
-        logger.info(f"✅ Scanned {self.stats['tables_scanned']} tables, {self.stats['rows_processed']:,} rows")
+        # Scan with progress tracking
+        for project_id in self.config['bigquery']['projects']:
+            logger.info(f"📂 Scanning project: {project_id}")
+            
+            try:
+                # Get client for project
+                client = self.scanner._get_client(project_id)
+                
+                # List ALL datasets
+                datasets = list(client.list_datasets())
+                logger.info(f"  Found {len(datasets)} datasets")
+                
+                for dataset_ref in datasets:
+                    dataset_id = dataset_ref.dataset_id
+                    logger.info(f"  📁 Scanning dataset: {dataset_id}")
+                    
+                    # List ALL tables in dataset
+                    tables = list(client.list_tables(f"{project_id}.{dataset_id}"))
+                    logger.info(f"    Found {len(tables)} tables")
+                    
+                    # Process EVERY table
+                    for table_ref in tables:
+                        table_id = table_ref.table_id
+                        
+                        # Use data loader for efficient processing
+                        table_data = await self._scan_table_with_ml(
+                            client, project_id, dataset_id, table_id
+                        )
+                        
+                        if table_data:
+                            all_data.append({
+                                'type': 'bigquery',
+                                'source': f'{project_id}.{dataset_id}.{table_id}',
+                                'project': project_id,
+                                'dataset': dataset_id,
+                                'table': table_id,
+                                'tables': [table_data]
+                            })
+                            self.stats['tables_scanned'] += 1
+                    
+                    self.stats['datasets_scanned'] += 1
+                    
+                    # Stream progress
+                    await self.streaming_handler.publish('scan_progress', {
+                        'project': project_id,
+                        'dataset': dataset_id,
+                        'tables_scanned': self.stats['tables_scanned']
+                    })
+                
+                self.stats['projects_scanned'] += 1
+                
+            except Exception as e:
+                logger.error(f"Error scanning project {project_id}: {e}")
         
-        # Step 2: Discover hosts and infrastructure
-        logger.info("\n🔍 Step 2: Discovering infrastructure from BigQuery data...")
-        discovered_hosts = await self.discovery.discover_hosts(bigquery_data)
+        logger.info(f"✅ Scanned {self.stats['tables_scanned']} tables total")
+        return all_data
+    
+    async def _scan_table_with_ml(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+        """Scan table with ML-enhanced column detection"""
+        full_table_id = f"{project_id}.{dataset_id}.{table_id}"
         
-        self.stats['hosts_discovered'] = len(discovered_hosts)
-        logger.info(f"✅ Discovered {self.stats['hosts_discovered']} hosts/devices")
+        try:
+            # Get table metadata
+            table = client.get_table(full_table_id)
+            
+            if table.num_rows == 0:
+                return None
+            
+            # Determine sampling strategy
+            sample_size = min(
+                int(table.num_rows * self.config['bigquery']['sample_percent'] / 100),
+                self.config['bigquery']['max_rows_per_table']
+            )
+            
+            # Query with efficient sampling
+            query = f"""
+            SELECT *
+            FROM `{full_table_id}`
+            TABLESAMPLE SYSTEM ({min(self.config['bigquery']['sample_percent'], 100)} PERCENT)
+            LIMIT {sample_size}
+            """
+            
+            # Use data loader for efficient processing
+            rows_df = client.query(query).to_dataframe()
+            
+            # Extract features for each column
+            columns_with_features = {}
+            for col_name in rows_df.columns:
+                values = rows_df[col_name].tolist()
+                
+                # Extract features using feature extractor
+                features = await self.feature_extractor.extract(col_name, values)
+                
+                columns_with_features[col_name] = {
+                    'name': col_name,
+                    'samples': values[:100],
+                    'features': features,
+                    'statistics': self._analyze_column(col_name, values)
+                }
+            
+            self.stats['rows_processed'] += len(rows_df)
+            
+            return {
+                'name': table_id,
+                'full_name': full_table_id,
+                'rows': rows_df.to_dict('records'),
+                'columns': columns_with_features,
+                'row_count': len(rows_df),
+                'total_rows': table.num_rows
+            }
+            
+        except Exception as e:
+            logger.error(f"Error scanning table {full_table_id}: {e}")
+            return None
+    
+    async def _classify_all_columns(self, bigquery_data: List[Dict]) -> Dict:
+        """Classify ALL columns using ensemble ML models"""
+        all_classifications = {}
         
-        # Step 3: Find relationships
-        logger.info("\n🔗 Step 3: Mapping relationships...")
-        relationships = await self.discovery.find_relationships(discovered_hosts)
+        for data_source in bigquery_data:
+            for table_data in data_source.get('tables', []):
+                columns = table_data.get('columns', {})
+                
+                for col_name, col_info in columns.items():
+                    # Use ensemble predictor for classification
+                    classification = await self.ensemble_predictor.classify_columns(
+                        {col_name: col_info},
+                        {}
+                    )
+                    
+                    all_classifications[f"{data_source['source']}:{col_name}"] = classification.get(col_name, {})
+                    self.stats['columns_classified'] += 1
+        
+        # Persist classifications
+        await self.metadata_store.persist_metadata(all_classifications)
+        
+        logger.info(f"✅ Classified {self.stats['columns_classified']} columns")
+        return all_classifications
+    
+    async def _learn_hostname_patterns(self, bigquery_data: List[Dict], classifications: Dict):
+        """Learn hostname patterns from discovered data"""
+        hostname_samples = []
+        
+        # Collect all identified hostname columns
+        for key, classification in classifications.items():
+            if classification.get('type') in ['hostname', 'server', 'host', 'instance']:
+                # Extract table and column from key
+                parts = key.split(':')
+                if len(parts) == 2:
+                    table_source = parts[0]
+                    col_name = parts[1]
+                    
+                    # Find the actual data
+                    for data_source in bigquery_data:
+                        if data_source.get('source') == table_source:
+                            for table_data in data_source.get('tables', []):
+                                if col_name in table_data.get('columns', {}):
+                                    samples = table_data['columns'][col_name].get('samples', [])
+                                    hostname_samples.extend(samples[:50])
+        
+        if hostname_samples:
+            # Learn patterns using ML
+            patterns = self._extract_patterns(hostname_samples)
+            self.learned_hostname_patterns.extend(patterns)
+            self.stats['hostname_patterns_learned'] = len(patterns)
+            
+            logger.info(f"✅ Learned {len(patterns)} hostname patterns")
+            
+            # Find associated columns
+            await self._find_associated_columns(bigquery_data, classifications)
+    
+    def _extract_patterns(self, samples: List) -> List[Dict]:
+        """Extract patterns from hostname samples"""
+        patterns = []
+        
+        # Analyze naming conventions
+        for sample in samples[:100]:
+            if sample:
+                sample_str = str(sample).lower()
+                
+                # Check for common patterns
+                if '-' in sample_str:
+                    parts = sample_str.split('-')
+                    pattern = {
+                        'type': 'hyphenated',
+                        'segments': len(parts),
+                        'example': sample_str,
+                        'regex': r'^[a-z0-9]+(-[a-z0-9]+)*$'
+                    }
+                    patterns.append(pattern)
+                
+                elif '.' in sample_str:
+                    parts = sample_str.split('.')
+                    pattern = {
+                        'type': 'fqdn',
+                        'segments': len(parts),
+                        'example': sample_str,
+                        'regex': r'^[a-z0-9]+(\.[a-z0-9]+)*$'
+                    }
+                    patterns.append(pattern)
+        
+        # Deduplicate patterns
+        unique_patterns = []
+        seen = set()
+        for pattern in patterns:
+            key = f"{pattern['type']}:{pattern['segments']}"
+            if key not in seen:
+                unique_patterns.append(pattern)
+                seen.add(key)
+        
+        return unique_patterns
+    
+    async def _find_associated_columns(self, bigquery_data: List[Dict], classifications: Dict):
+        """Find columns that frequently appear with hostname columns"""
+        cooccurrence = {}
+        
+        for data_source in bigquery_data:
+            for table_data in data_source.get('tables', []):
+                columns = list(table_data.get('columns', {}).keys())
+                
+                # Find hostname columns in this table
+                hostname_cols = []
+                for col in columns:
+                    key = f"{data_source['source']}:{col}"
+                    if key in classifications:
+                        if classifications[key].get('type') in ['hostname', 'server', 'host']:
+                            hostname_cols.append(col)
+                
+                # Track co-occurrence
+                if hostname_cols:
+                    for hostname_col in hostname_cols:
+                        if hostname_col not in cooccurrence:
+                            cooccurrence[hostname_col] = {}
+                        
+                        for other_col in columns:
+                            if other_col != hostname_col:
+                                if other_col not in cooccurrence[hostname_col]:
+                                    cooccurrence[hostname_col][other_col] = 0
+                                cooccurrence[hostname_col][other_col] += 1
+        
+        # Find most common associations
+        for hostname_col, associations in cooccurrence.items():
+            if associations:
+                # Sort by frequency
+                sorted_assoc = sorted(associations.items(), key=lambda x: x[1], reverse=True)
+                self.associated_columns[hostname_col] = [col for col, _ in sorted_assoc[:10]]
+        
+        logger.info(f"✅ Found associated columns for {len(self.associated_columns)} hostname columns")
+    
+    async def _discover_all_hosts(self, bigquery_data: List[Dict], classifications: Dict) -> Dict:
+        """Discover ALL unique hosts from ALL tables"""
+        all_discovered_hosts = {}
+        
+        # Process each table
+        for data_source in bigquery_data:
+            # Use discovery module with learned patterns
+            hosts = await self.discovery.discover_hosts([data_source])
+            
+            # Merge with existing hosts
+            for hostname, host_data in hosts.items():
+                if hostname not in all_discovered_hosts:
+                    all_discovered_hosts[hostname] = host_data
+                else:
+                    # Merge data from multiple sources
+                    existing = all_discovered_hosts[hostname]
+                    existing['sources'].extend(host_data.get('sources', []))
+                    
+                    # Merge attributes
+                    for attr, values in host_data.get('attributes', {}).items():
+                        if attr not in existing['attributes']:
+                            existing['attributes'][attr] = []
+                        if isinstance(values, list):
+                            existing['attributes'][attr].extend(values)
+                        else:
+                            existing['attributes'][attr].append(values)
+        
+        self.stats['hosts_discovered'] = len(all_discovered_hosts)
+        
+        # Stream discoveries
+        await self.streaming_handler.stream_discoveries(all_discovered_hosts)
+        
+        logger.info(f"✅ Discovered {len(all_discovered_hosts)} total unique hosts")
+        return all_discovered_hosts
+    
+    async def _resolve_entities(self, discovered_hosts: Dict) -> Dict:
+        """Resolve and deduplicate entities"""
+        resolved = await self.entity_resolver.resolve(
+            discovered_hosts,
+            self.associated_columns
+        )
+        
+        self.stats['unique_hosts'] = len(resolved)
+        logger.info(f"✅ Resolved to {len(resolved)} unique hosts")
+        return resolved
+    
+    async def _enrich_hosts(self, resolved_hosts: Dict, classifications: Dict) -> List[Dict]:
+        """Enrich hosts with context and classification"""
+        enriched = []
+        
+        for hostname, host_data in resolved_hosts.items():
+            # Classify the host
+            classification = await self.classifier.classify_host(hostname, host_data)
+            
+            # Enrich with context
+            enriched_host = await self.context_analyzer.enrich_host_data(
+                hostname,
+                host_data,
+                classifications
+            )
+            
+            enriched_host['classification'] = classification
+            enriched.append(enriched_host)
+        
+        # Index in metadata store
+        await self.metadata_store.index_hosts(enriched)
+        
+        logger.info(f"✅ Enriched {len(enriched)} hosts")
+        return enriched
+    
+    async def _discover_relationships(self, enriched_hosts: List[Dict]) -> List[Dict]:
+        """Discover relationships between hosts"""
+        # Convert list to dict for relationship mapper
+        hosts_dict = {h['hostname']: h for h in enriched_hosts}
+        
+        relationships = self.relationship_mapper.map_relationships(hosts_dict)
         
         self.stats['relationships_found'] = len(relationships)
-        logger.info(f"✅ Found {self.stats['relationships_found']} relationships")
         
-        # Step 4: Build CMDB
-        logger.info("\n🏗️ Step 4: Building CMDB database...")
-        await self.builder.build(discovered_hosts, relationships)
-        logger.info(f"✅ CMDB created at {self.config['output_database']}")
+        # Stream relationships
+        await self.streaming_handler.stream_relationships(relationships)
         
-        # Step 5: Export results
-        if self.config.get('export', {}).get('csv'):
-            await self.export_results(discovered_hosts, 'csv')
-        if self.config.get('export', {}).get('json'):
-            await self.export_results(discovered_hosts, 'json')
+        # Store in metadata store
+        await self.metadata_store.create_graph_relationships(relationships)
         
-        # Print summary
-        self.print_summary()
-        
-        return True
+        logger.info(f"✅ Found {len(relationships)} relationships")
+        return relationships
     
-    async def export_results(self, hosts: Dict, format: str):
-        """Export discovered hosts"""
+    async def _analyze_quality(self, hosts: List[Dict], relationships: List[Dict]) -> Dict:
+        """Analyze data quality"""
+        cmdb_data = {
+            'entities': hosts,
+            'relationships': relationships
+        }
+        
+        quality_report = self.quality_analyzer.analyze(cmdb_data)
+        anomalies = self.quality_analyzer.detect_anomalies(cmdb_data)
+        insights = self.quality_analyzer.generate_insights(cmdb_data)
+        
+        quality_report['anomalies'] = anomalies
+        quality_report['insights'] = insights
+        
+        logger.info(f"✅ Quality score: {quality_report['overall_quality_score']:.2%}")
+        return quality_report
+    
+    async def _build_graph(self, hosts: List[Dict], relationships: List[Dict]) -> Dict:
+        """Build knowledge graph"""
+        graph = await self.graph_builder.build(hosts, relationships)
+        
+        logger.info(f"✅ Built graph with {len(graph.get('nodes', []))} nodes")
+        return graph
+    
+    async def _build_final_cmdb(self, hosts: List[Dict], relationships: List[Dict], graph: Dict):
+        """Build the final CMDB database"""
+        await self.builder.initialize()
+        
+        # Create schema with all discovered columns
+        all_columns = set()
+        for host in hosts:
+            all_columns.update(host.keys())
+        
+        columns = [{'name': col, 'type': 'string'} for col in all_columns]
+        await self.builder.create_schema(columns)
+        
+        # Insert hosts
+        await self.builder.insert_hosts(hosts)
+        
+        # Insert relationships
+        await self.builder.insert_relationships(relationships)
+        
+        # Create indexes
+        await self.builder.create_indexes()
+        
+        # Get statistics
+        stats = self.builder.get_statistics()
+        logger.info(f"✅ CMDB built with {stats.get('total_hosts', 0)} hosts")
+    
+    async def _stream_results(self, hosts: List[Dict], relationships: List[Dict]):
+        """Stream results to Kafka if configured"""
+        if self.streaming_handler.producer:
+            # Stream hosts in batches
+            for i in range(0, len(hosts), 100):
+                batch = hosts[i:i+100]
+                await self.streaming_handler.publish_batch('cmdb_hosts', batch)
+            
+            # Stream relationships
+            for i in range(0, len(relationships), 100):
+                batch = relationships[i:i+100]
+                await self.streaming_handler.publish_batch('cmdb_relationships', batch)
+            
+            logger.info("✅ Streamed results to Kafka")
+    
+    async def _export_results(self, hosts: List[Dict], relationships: List[Dict], quality_report: Dict):
+        """Export results in multiple formats"""
         output_dir = Path(self.config.get('export', {}).get('output_dir', 'output'))
         output_dir.mkdir(exist_ok=True)
         
-        if format == 'csv':
-            import csv
-            output_file = output_dir / f"cmdb_hosts_{datetime.now():%Y%m%d_%H%M%S}.csv"
-            
-            with open(output_file, 'w', newline='') as f:
-                if hosts:
-                    fieldnames = set()
-                    for host in hosts.values():
-                        fieldnames.update(host.keys())
-                    
-                    writer = csv.DictWriter(f, fieldnames=sorted(fieldnames))
-                    writer.writeheader()
-                    writer.writerows(hosts.values())
-            
-            logger.info(f"📁 Exported to {output_file}")
+        # Export hosts
+        import csv
+        csv_file = output_dir / f"cmdb_hosts_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        with open(csv_file, 'w', newline='') as f:
+            if hosts:
+                writer = csv.DictWriter(f, fieldnames=hosts[0].keys())
+                writer.writeheader()
+                writer.writerows(hosts)
         
-        elif format == 'json':
-            output_file = output_dir / f"cmdb_hosts_{datetime.now():%Y%m%d_%H%M%S}.json"
-            
-            with open(output_file, 'w') as f:
-                json.dump(hosts, f, indent=2, default=str)
-            
-            logger.info(f"📁 Exported to {output_file}")
+        # Export as JSON
+        json_file = output_dir / f"cmdb_complete_{datetime.now():%Y%m%d_%H%M%S}.json"
+        with open(json_file, 'w') as f:
+            json.dump({
+                'hosts': hosts,
+                'relationships': relationships,
+                'quality_report': quality_report,
+                'statistics': self.stats,
+                'learned_patterns': self.learned_hostname_patterns,
+                'associated_columns': self.associated_columns
+            }, f, indent=2, default=str)
+        
+        # Export to Parquet
+        self.builder.export_to_parquet(str(output_dir / 'cmdb_hosts.parquet'))
+        
+        logger.info(f"✅ Exported results to {output_dir}")
     
-    def print_summary(self):
-        """Print discovery summary"""
+    def _save_checkpoint(self, hosts):
+        """Save checkpoint for resume capability"""
+        state = {
+            'statistics': self.stats,
+            'patterns': self.learned_hostname_patterns,
+            'associated_columns': self.associated_columns,
+            'hosts': len(hosts) if hosts else 0
+        }
+        self.checkpoint_manager.save(state)
+    
+    def _analyze_column(self, column_name: str, values: List) -> Dict:
+        """Analyze column statistics"""
+        return {
+            'unique_count': len(set(str(v) for v in values if v)),
+            'null_count': sum(1 for v in values if v is None or v == ''),
+            'total_count': len(values),
+            'sample_values': list(set(str(v) for v in values[:10] if v))
+        }
+    
+    def _print_comprehensive_summary(self, quality_report: Dict):
+        """Print comprehensive discovery summary"""
         duration = (datetime.now() - self.stats['start_time']).total_seconds()
         
-        print("\n" + "="*60)
-        print("BIGQUERY CMDB DISCOVERY SUMMARY")
-        print("="*60)
-        print(f"Duration:             {duration:.1f} seconds")
-        print(f"Projects Scanned:     {self.stats['projects_scanned']}")
-        print(f"Datasets Scanned:     {self.stats['datasets_scanned']}")
-        print(f"Tables Scanned:       {self.stats['tables_scanned']}")
-        print(f"Rows Processed:       {self.stats['rows_processed']:,}")
-        print("-"*60)
-        print(f"Hosts Discovered:     {self.stats['hosts_discovered']}")
-        print(f"Relationships Found:  {self.stats['relationships_found']}")
-        print("-"*60)
-        print(f"CMDB Database:        {self.config['output_database']}")
-        print(f"Query with:           sqlite3 {self.config['output_database']}")
-        print("="*60)
+        print("\n" + "="*80)
+        print("COMPREHENSIVE BIGQUERY CMDB DISCOVERY SUMMARY")
+        print("="*80)
+        print(f"Duration:                    {duration:.1f} seconds")
+        print(f"Projects Scanned:            {self.stats['projects_scanned']}")
+        print(f"Datasets Scanned:            {self.stats['datasets_scanned']}")
+        print(f"Tables Scanned:              {self.stats['tables_scanned']}")
+        print(f"Rows Processed:              {self.stats['rows_processed']:,}")
+        print(f"Columns Classified:          {self.stats['columns_classified']}")
+        print("-"*80)
+        print(f"Hosts Discovered:            {self.stats['hosts_discovered']}")
+        print(f"Unique Hosts (Resolved):     {self.stats['unique_hosts']}")
+        print(f"Relationships Found:         {self.stats['relationships_found']}")
+        print(f"Hostname Patterns Learned:   {self.stats['hostname_patterns_learned']}")
+        print(f"Associated Columns Found:    {len(self.associated_columns)}")
+        print("-"*80)
+        print(f"Overall Quality Score:       {quality_report.get('overall_quality_score', 0):.2%}")
+        print(f"Data Anomalies:              {len(quality_report.get('anomalies', []))}")
+        print(f"Insights Generated:          {len(quality_report.get('insights', []))}")
+        print("-"*80)
+        print(f"CMDB Database:               {self.config['output_database']}")
+        print(f"Device Used:                 {self.device}")
+        print("="*80)
         
-        # Show example queries
-        print("\nExample queries to explore your CMDB:")
-        print("  SELECT * FROM hosts LIMIT 10;")
-        print("  SELECT environment, COUNT(*) FROM hosts GROUP BY environment;")
-        print("  SELECT h1.hostname, h2.hostname, r.relationship_type")
-        print("    FROM relationships r")
-        print("    JOIN hosts h1 ON r.source_id = h1.id")
-        print("    JOIN hosts h2 ON r.target_id = h2.id;")
-        print("="*60)
+        # Print top insights
+        if quality_report.get('insights'):
+            print("\nTop Insights:")
+            for i, insight in enumerate(quality_report['insights'][:5], 1):
+                print(f"  {i}. {insight}")
+        
+        # Print learned patterns
+        if self.learned_hostname_patterns:
+            print("\nLearned Hostname Patterns:")
+            for pattern in self.learned_hostname_patterns[:5]:
+                print(f"  - {pattern['type']}: {pattern.get('example', 'N/A')}")
+        
+        print("\n✅ Discovery complete! Query your CMDB with:")
+        print(f"   sqlite3 {self.config['output_database']}")
+        print("="*80)
 
 async def main():
     parser = argparse.ArgumentParser(
-        description='BigQuery CMDB Discovery - Scan BigQuery to build infrastructure CMDB'
+        description='Enhanced BigQuery CMDB Discovery - Comprehensive Infrastructure Scanner'
     )
     parser.add_argument('--config', default='config.json', help='Configuration file')
-    parser.add_argument('--projects', nargs='+', help='Override BigQuery projects to scan')
+    parser.add_argument('--projects', nargs='+', help='Override BigQuery projects')
+    parser.add_argument('--no-filter', action='store_true', help='Scan ALL datasets and tables')
+    parser.add_argument('--learn-patterns', action='store_true', default=True, help='Learn hostname patterns')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
@@ -233,16 +736,21 @@ async def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    system = BigQueryCMDBSystem(args.config)
+    system = EnhancedBigQueryCMDBSystem(args.config)
     
     # Override projects if specified
     if args.projects:
         system.config['bigquery']['projects'] = args.projects
     
+    # Ensure no filtering
+    if args.no_filter:
+        system.config['bigquery']['datasets_filter'] = []
+        system.config['bigquery']['tables_filter'] = []
+    
     success = await system.run()
     
     if success:
-        logger.info("✅ BigQuery CMDB Discovery completed successfully!")
+        logger.info("✅ Enhanced BigQuery CMDB Discovery completed successfully!")
     else:
         logger.error("❌ Discovery failed")
         sys.exit(1)

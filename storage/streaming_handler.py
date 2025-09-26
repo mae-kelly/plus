@@ -1,6 +1,5 @@
 import json
-from typing import Dict, Any
-from kafka import KafkaProducer, KafkaConsumer
+from typing import Dict, Any, List
 from datetime import datetime
 import logging
 import asyncio
@@ -10,26 +9,32 @@ logger = logging.getLogger(__name__)
 class StreamingHandler:
     def __init__(self, config: Dict):
         self.config = config
-        self.brokers = config['storage'].get('kafka_brokers', ['localhost:9092'])
+        self.brokers = config['storage'].get('kafka_brokers', [])
         
         self.producer = None
         self.consumers = {}
         
-        self._init_producer()
+        # Only initialize if brokers are configured
+        if self.brokers and len(self.brokers) > 0 and self.brokers[0]:
+            self._init_producer()
     
     def _init_producer(self):
         try:
+            from kafka import KafkaProducer
+            
             self.producer = KafkaProducer(
                 bootstrap_servers=self.brokers,
                 value_serializer=lambda v: json.dumps(v).encode('utf-8'),
                 key_serializer=lambda k: k.encode('utf-8') if k else None,
                 compression_type='gzip',
                 batch_size=16384,
-                linger_ms=10
+                linger_ms=10,
+                max_block_ms=1000  # Don't wait forever if Kafka is down
             )
             logger.info("Kafka producer initialized")
         except Exception as e:
-            logger.error(f"Failed to initialize Kafka producer: {e}")
+            logger.warning(f"Kafka not available: {e}. Continuing without streaming.")
+            self.producer = None
     
     async def publish(self, topic: str, message: Dict, key: str = None):
         if not self.producer:
@@ -44,12 +49,12 @@ class StreamingHandler:
                 key=key
             )
             
-            self.producer.flush()
+            self.producer.flush(timeout=1)  # Don't wait forever
             
             logger.debug(f"Published to {topic}: {message.get('type', 'unknown')}")
             
         except Exception as e:
-            logger.error(f"Failed to publish message: {e}")
+            logger.debug(f"Could not publish message: {e}")
     
     async def publish_batch(self, topic: str, messages: List[Dict]):
         if not self.producer:
@@ -65,23 +70,32 @@ class StreamingHandler:
                     key=message.get('hostname')
                 )
             except Exception as e:
-                logger.error(f"Failed to send message: {e}")
+                logger.debug(f"Could not send message: {e}")
         
-        self.producer.flush()
-        logger.info(f"Published batch of {len(messages)} messages to {topic}")
+        try:
+            self.producer.flush(timeout=1)
+            logger.info(f"Published batch of {len(messages)} messages to {topic}")
+        except:
+            pass
     
     def subscribe(self, topic: str, group_id: str = 'cmdb_consumer'):
+        if not self.brokers or len(self.brokers) == 0:
+            return None
+            
         if topic in self.consumers:
             return self.consumers[topic]
         
         try:
+            from kafka import KafkaConsumer
+            
             consumer = KafkaConsumer(
                 topic,
                 bootstrap_servers=self.brokers,
                 group_id=group_id,
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
                 auto_offset_reset='latest',
-                enable_auto_commit=True
+                enable_auto_commit=True,
+                consumer_timeout_ms=1000  # Don't wait forever
             )
             
             self.consumers[topic] = consumer
@@ -90,7 +104,7 @@ class StreamingHandler:
             return consumer
             
         except Exception as e:
-            logger.error(f"Failed to subscribe to {topic}: {e}")
+            logger.debug(f"Could not subscribe to {topic}: {e}")
             return None
     
     async def consume_messages(self, topic: str, handler_func, max_messages: int = None):
@@ -111,11 +125,14 @@ class StreamingHandler:
                     break
                     
         except Exception as e:
-            logger.error(f"Error consuming messages: {e}")
+            logger.debug(f"Error consuming messages: {e}")
         finally:
             consumer.close()
     
     async def stream_discoveries(self, discovered_hosts: Dict):
+        if not self.producer:
+            return
+            
         topic = 'cmdb_discoveries'
         
         for hostname, data in discovered_hosts.items():
@@ -130,6 +147,9 @@ class StreamingHandler:
             await self.publish(topic, message, key=hostname)
     
     async def stream_classifications(self, classifications: Dict):
+        if not self.producer:
+            return
+            
         topic = 'cmdb_classifications'
         
         for column_name, classification in classifications.items():
@@ -144,6 +164,9 @@ class StreamingHandler:
             await self.publish(topic, message, key=column_name)
     
     async def stream_relationships(self, relationships: List[Dict]):
+        if not self.producer:
+            return
+            
         topic = 'cmdb_relationships'
         
         for rel in relationships:
@@ -161,19 +184,31 @@ class StreamingHandler:
         metrics = {}
         
         if self.producer:
-            metrics['producer'] = self.producer.metrics()
+            try:
+                metrics['producer'] = self.producer.metrics()
+            except:
+                pass
         
         for topic, consumer in self.consumers.items():
-            metrics[f'consumer_{topic}'] = consumer.metrics()
+            try:
+                metrics[f'consumer_{topic}'] = consumer.metrics()
+            except:
+                pass
         
         return metrics
     
     def close(self):
         if self.producer:
-            self.producer.close()
-            logger.info("Kafka producer closed")
+            try:
+                self.producer.close()
+                logger.info("Kafka producer closed")
+            except:
+                pass
         
         for consumer in self.consumers.values():
-            consumer.close()
+            try:
+                consumer.close()
+            except:
+                pass
         
         logger.info("Streaming handler closed")

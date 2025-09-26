@@ -1,286 +1,248 @@
 #!/usr/bin/env python3
 """
-Smart CMDB Discovery System
-Automatically discovers and classifies IT infrastructure from various data sources
+BigQuery CMDB Discovery System
+Scans BigQuery projects to automatically discover and build a CMDB of your infrastructure
 """
 
 import asyncio
 import json
 import logging
 import argparse
-import signal
 import sys
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from core.orchestrator import DiscoveryOrchestrator
-from core.config_manager import ConfigManager
+from core.bigquery_scanner import BigQueryScanner
+from core.cmdb_discovery import CMDBDiscovery
+from core.cmdb_builder import CMDBBuilder
 from utils.logger import setup_logging
 
-# Setup logging
-logger = setup_logging('cmdb_discovery')
+logger = setup_logging('bigquery_cmdb')
 
-class CMDBDiscoverySystem:
-    """Main CMDB Discovery System"""
+class BigQueryCMDBSystem:
+    """Main system to scan BigQuery and build CMDB"""
     
     def __init__(self, config_path: str = 'config.json'):
-        self.config_manager = ConfigManager(config_path)
-        self.config = self.config_manager.load_config()
-        self.orchestrator = None
-        self.shutdown_requested = False
+        self.config = self.load_config(config_path)
+        self.scanner = BigQueryScanner(self.config)
+        self.discovery = CMDBDiscovery(self.config)
+        self.builder = CMDBBuilder(self.config.get('output_database', 'cmdb.db'))
+        self.stats = {
+            'start_time': datetime.now(),
+            'projects_scanned': 0,
+            'datasets_scanned': 0,
+            'tables_scanned': 0,
+            'rows_processed': 0,
+            'hosts_discovered': 0,
+            'relationships_found': 0
+        }
+    
+    def load_config(self, config_path: str) -> Dict:
+        """Load configuration"""
+        path = Path(config_path)
+        if not path.exists():
+            logger.error(f"Config file not found: {config_path}")
+            self.create_default_config(path)
+            logger.info(f"Created default config at {config_path}")
+            logger.info("Please edit it with your BigQuery projects and credentials")
+            sys.exit(1)
         
-        # Register signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        with open(path) as f:
+            config = json.load(f)
+        
+        # Validate BigQuery configuration
+        if not config.get('bigquery', {}).get('projects'):
+            logger.error("No BigQuery projects configured!")
+            logger.error("Edit config.json and add your project IDs under 'bigquery.projects'")
+            sys.exit(1)
+        
+        return config
     
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        logger.info("Shutdown signal received, saving state...")
-        self.shutdown_requested = True
-        if self.orchestrator:
-            self.orchestrator.save_checkpoint()
-        sys.exit(0)
+    def create_default_config(self, path: Path):
+        """Create default configuration for BigQuery scanning"""
+        config = {
+            "bigquery": {
+                "projects": ["your-project-id-1", "your-project-id-2"],
+                "credentials_path": "gcp_credentials.json",
+                "datasets_filter": [],  # Leave empty to scan all datasets
+                "tables_filter": [],    # Leave empty to scan all tables
+                "sample_percent": 10,   # Sample 10% of large tables
+                "max_rows_per_table": 100000
+            },
+            "discovery": {
+                "hostname_patterns": [
+                    {"column_pattern": ".*host.*", "confidence": 0.9},
+                    {"column_pattern": ".*server.*", "confidence": 0.8},
+                    {"column_pattern": ".*instance.*", "confidence": 0.8},
+                    {"column_pattern": ".*node.*", "confidence": 0.7},
+                    {"column_pattern": ".*machine.*", "confidence": 0.7},
+                    {"column_pattern": ".*device.*", "confidence": 0.6}
+                ],
+                "ip_patterns": [
+                    {"column_pattern": ".*ip.*address.*", "confidence": 0.95},
+                    {"column_pattern": ".*ip.*", "confidence": 0.8},
+                    {"column_pattern": ".*addr.*", "confidence": 0.6}
+                ],
+                "environment_patterns": [
+                    {"column_pattern": ".*env.*", "confidence": 0.9},
+                    {"column_pattern": ".*environment.*", "confidence": 0.95},
+                    {"column_pattern": ".*stage.*", "confidence": 0.7}
+                ],
+                "application_patterns": [
+                    {"column_pattern": ".*app.*", "confidence": 0.8},
+                    {"column_pattern": ".*service.*", "confidence": 0.8},
+                    {"column_pattern": ".*application.*", "confidence": 0.9}
+                ]
+            },
+            "output_database": "bigquery_cmdb.db",
+            "export": {
+                "csv": true,
+                "json": true,
+                "output_dir": "output"
+            },
+            "logging": {
+                "level": "INFO",
+                "file": "logs/bigquery_cmdb.log"
+            }
+        }
+        
+        with open(path, 'w') as f:
+            json.dump(config, f, indent=2)
     
-    async def run(self, mode: str = 'discover'):
-        """Run the discovery system"""
+    async def run(self):
+        """Main execution"""
         logger.info("="*60)
-        logger.info("Smart CMDB Discovery System v2.0")
+        logger.info("BigQuery CMDB Discovery System")
         logger.info("="*60)
         
-        # Validate environment
-        if not self._validate_environment():
-            logger.error("Environment validation failed")
+        # Step 1: Scan BigQuery
+        logger.info("\n📊 Step 1: Scanning BigQuery projects...")
+        bigquery_data = await self.scanner.scan_all_projects()
+        
+        if not bigquery_data:
+            logger.error("No data found in BigQuery! Check your configuration and credentials.")
             return False
         
-        # Initialize orchestrator
-        self.orchestrator = DiscoveryOrchestrator(self.config)
+        self.stats['projects_scanned'] = len(self.scanner.projects_scanned)
+        self.stats['datasets_scanned'] = self.scanner.datasets_scanned
+        self.stats['tables_scanned'] = self.scanner.tables_scanned
+        self.stats['rows_processed'] = self.scanner.rows_processed
         
-        # Load checkpoint if resuming
-        if self.config.get('resume_enabled', True):
-            self.orchestrator.load_checkpoint()
+        logger.info(f"✅ Scanned {self.stats['tables_scanned']} tables, {self.stats['rows_processed']:,} rows")
         
-        try:
-            if mode == 'discover':
-                await self._run_discovery()
-            elif mode == 'analyze':
-                await self._run_analysis()
-            elif mode == 'demo':
-                await self._run_demo()
-            else:
-                logger.error(f"Unknown mode: {mode}")
-                return False
-                
-            return True
-            
-        except Exception as e:
-            logger.error(f"System error: {e}", exc_info=True)
-            self.orchestrator.save_checkpoint()
-            return False
-    
-    async def _run_discovery(self):
-        """Run full discovery process"""
-        logger.info("Starting discovery process...")
+        # Step 2: Discover hosts and infrastructure
+        logger.info("\n🔍 Step 2: Discovering infrastructure from BigQuery data...")
+        discovered_hosts = await self.discovery.discover_hosts(bigquery_data)
         
-        # Phase 1: Data source discovery
-        logger.info("Phase 1: Scanning data sources")
-        discovered_data = await self.orchestrator.scan_data_sources()
-        logger.info(f"Discovered {len(discovered_data)} data sources")
+        self.stats['hosts_discovered'] = len(discovered_hosts)
+        logger.info(f"✅ Discovered {self.stats['hosts_discovered']} hosts/devices")
         
-        # Phase 2: Host extraction
-        logger.info("Phase 2: Extracting hosts")
-        hosts = await self.orchestrator.extract_hosts(discovered_data)
-        logger.info(f"Extracted {len(hosts)} potential hosts")
+        # Step 3: Find relationships
+        logger.info("\n🔗 Step 3: Mapping relationships...")
+        relationships = await self.discovery.find_relationships(discovered_hosts)
         
-        # Phase 3: Classification
-        logger.info("Phase 3: Classifying entities")
-        classified = await self.orchestrator.classify_entities(hosts)
-        logger.info(f"Classified {len(classified)} entities")
+        self.stats['relationships_found'] = len(relationships)
+        logger.info(f"✅ Found {self.stats['relationships_found']} relationships")
         
-        # Phase 4: Relationship mapping
-        logger.info("Phase 4: Mapping relationships")
-        relationships = await self.orchestrator.map_relationships(classified)
-        logger.info(f"Mapped {len(relationships)} relationships")
+        # Step 4: Build CMDB
+        logger.info("\n🏗️ Step 4: Building CMDB database...")
+        await self.builder.build(discovered_hosts, relationships)
+        logger.info(f"✅ CMDB created at {self.config['output_database']}")
         
-        # Phase 5: Build CMDB
-        logger.info("Phase 5: Building CMDB")
-        await self.orchestrator.build_cmdb(classified, relationships)
+        # Step 5: Export results
+        if self.config.get('export', {}).get('csv'):
+            await self.export_results(discovered_hosts, 'csv')
+        if self.config.get('export', {}).get('json'):
+            await self.export_results(discovered_hosts, 'json')
         
-        # Generate report
-        self._generate_report()
-    
-    async def _run_analysis(self):
-        """Run analysis on existing CMDB"""
-        logger.info("Running CMDB analysis...")
+        # Print summary
+        self.print_summary()
         
-        # Load existing CMDB
-        cmdb_data = await self.orchestrator.load_cmdb()
-        
-        if not cmdb_data:
-            logger.error("No CMDB data found. Run discovery first.")
-            return
-        
-        # Analyze data quality
-        quality_report = await self.orchestrator.analyze_data_quality(cmdb_data)
-        
-        # Find anomalies
-        anomalies = await self.orchestrator.detect_anomalies(cmdb_data)
-        
-        # Generate insights
-        insights = await self.orchestrator.generate_insights(cmdb_data)
-        
-        # Print results
-        self._print_analysis_results(quality_report, anomalies, insights)
-    
-    async def _run_demo(self):
-        """Run demo with synthetic data"""
-        logger.info("Running demo mode with synthetic data...")
-        
-        from utils.demo_generator import DemoDataGenerator
-        
-        generator = DemoDataGenerator()
-        demo_data = generator.generate_demo_environment(
-            n_hosts=self.config.get('demo_hosts', 100),
-            n_applications=self.config.get('demo_apps', 20)
-        )
-        
-        # Run discovery on demo data
-        hosts = await self.orchestrator.extract_hosts(demo_data)
-        classified = await self.orchestrator.classify_entities(hosts)
-        relationships = await self.orchestrator.map_relationships(classified)
-        await self.orchestrator.build_cmdb(classified, relationships)
-        
-        logger.info("Demo completed successfully!")
-        self._generate_report()
-    
-    def _validate_environment(self) -> bool:
-        """Validate the environment is ready"""
-        issues = []
-        
-        # Check Python version
-        if sys.version_info < (3, 8):
-            issues.append("Python 3.8+ required")
-        
-        # Check required directories
-        for dir_name in ['logs', 'data', 'checkpoints', 'output']:
-            dir_path = Path(dir_name)
-            if not dir_path.exists():
-                dir_path.mkdir(parents=True)
-                logger.debug(f"Created directory: {dir_name}")
-        
-        # Check config
-        if not self.config:
-            issues.append("Configuration not loaded")
-        
-        if issues:
-            for issue in issues:
-                logger.error(f"Validation issue: {issue}")
-            return False
-        
-        logger.info("Environment validation passed")
         return True
     
-    def _generate_report(self):
-        """Generate discovery report"""
-        if not self.orchestrator:
-            return
+    async def export_results(self, hosts: Dict, format: str):
+        """Export discovered hosts"""
+        output_dir = Path(self.config.get('export', {}).get('output_dir', 'output'))
+        output_dir.mkdir(exist_ok=True)
         
-        stats = self.orchestrator.get_statistics()
+        if format == 'csv':
+            import csv
+            output_file = output_dir / f"cmdb_hosts_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            
+            with open(output_file, 'w', newline='') as f:
+                if hosts:
+                    fieldnames = set()
+                    for host in hosts.values():
+                        fieldnames.update(host.keys())
+                    
+                    writer = csv.DictWriter(f, fieldnames=sorted(fieldnames))
+                    writer.writeheader()
+                    writer.writerows(hosts.values())
+            
+            logger.info(f"📁 Exported to {output_file}")
         
-        print("\n" + "="*60)
-        print("DISCOVERY REPORT")
-        print("="*60)
-        print(f"Start Time:           {stats.get('start_time', 'N/A')}")
-        print(f"End Time:             {stats.get('end_time', 'N/A')}")
-        print(f"Duration:             {stats.get('duration', 'N/A')}")
-        print("-"*60)
-        print(f"Data Sources:         {stats.get('data_sources', 0):,}")
-        print(f"Tables Processed:     {stats.get('tables_processed', 0):,}")
-        print(f"Rows Scanned:         {stats.get('rows_scanned', 0):,}")
-        print("-"*60)
-        print(f"Hosts Discovered:     {stats.get('hosts_discovered', 0):,}")
-        print(f"Applications:         {stats.get('applications', 0):,}")
-        print(f"Relationships:        {stats.get('relationships', 0):,}")
-        print(f"Unique Environments:  {stats.get('environments', 0):,}")
-        print(f"Unique Datacenters:   {stats.get('datacenters', 0):,}")
-        print("-"*60)
-        print(f"Classification Accuracy: {stats.get('classification_accuracy', 0):.2%}")
-        print(f"Data Quality Score:      {stats.get('quality_score', 0):.2%}")
-        print("="*60)
-        print(f"\nCMDB Database: {self.config.get('output_database', 'cmdb.db')}")
-        print(f"Query with: sqlite3 {self.config.get('output_database', 'cmdb.db')}")
-        print("="*60)
+        elif format == 'json':
+            output_file = output_dir / f"cmdb_hosts_{datetime.now():%Y%m%d_%H%M%S}.json"
+            
+            with open(output_file, 'w') as f:
+                json.dump(hosts, f, indent=2, default=str)
+            
+            logger.info(f"📁 Exported to {output_file}")
     
-    def _print_analysis_results(self, quality_report, anomalies, insights):
-        """Print analysis results"""
+    def print_summary(self):
+        """Print discovery summary"""
+        duration = (datetime.now() - self.stats['start_time']).total_seconds()
+        
         print("\n" + "="*60)
-        print("CMDB ANALYSIS RESULTS")
+        print("BIGQUERY CMDB DISCOVERY SUMMARY")
+        print("="*60)
+        print(f"Duration:             {duration:.1f} seconds")
+        print(f"Projects Scanned:     {self.stats['projects_scanned']}")
+        print(f"Datasets Scanned:     {self.stats['datasets_scanned']}")
+        print(f"Tables Scanned:       {self.stats['tables_scanned']}")
+        print(f"Rows Processed:       {self.stats['rows_processed']:,}")
+        print("-"*60)
+        print(f"Hosts Discovered:     {self.stats['hosts_discovered']}")
+        print(f"Relationships Found:  {self.stats['relationships_found']}")
+        print("-"*60)
+        print(f"CMDB Database:        {self.config['output_database']}")
+        print(f"Query with:           sqlite3 {self.config['output_database']}")
         print("="*60)
         
-        # Data quality
-        print("\nData Quality:")
-        print("-"*40)
-        for metric, value in quality_report.items():
-            print(f"  {metric:30s}: {value}")
-        
-        # Anomalies
-        print(f"\nAnomalies Detected: {len(anomalies)}")
-        print("-"*40)
-        for i, anomaly in enumerate(anomalies[:10], 1):
-            print(f"  {i}. {anomaly['type']}: {anomaly['description']}")
-        
-        # Insights
-        print(f"\nKey Insights:")
-        print("-"*40)
-        for i, insight in enumerate(insights[:10], 1):
-            print(f"  {i}. {insight}")
-        
+        # Show example queries
+        print("\nExample queries to explore your CMDB:")
+        print("  SELECT * FROM hosts LIMIT 10;")
+        print("  SELECT environment, COUNT(*) FROM hosts GROUP BY environment;")
+        print("  SELECT h1.hostname, h2.hostname, r.relationship_type")
+        print("    FROM relationships r")
+        print("    JOIN hosts h1 ON r.source_id = h1.id")
+        print("    JOIN hosts h2 ON r.target_id = h2.id;")
         print("="*60)
 
 async def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description='Smart CMDB Discovery System')
-    parser.add_argument(
-        '--mode',
-        choices=['discover', 'analyze', 'demo'],
-        default='discover',
-        help='Operation mode'
+    parser = argparse.ArgumentParser(
+        description='BigQuery CMDB Discovery - Scan BigQuery to build infrastructure CMDB'
     )
-    parser.add_argument(
-        '--config',
-        default='config.json',
-        help='Configuration file path'
-    )
-    parser.add_argument(
-        '--no-resume',
-        action='store_true',
-        help='Start fresh without resuming from checkpoint'
-    )
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug logging'
-    )
+    parser.add_argument('--config', default='config.json', help='Configuration file')
+    parser.add_argument('--projects', nargs='+', help='Override BigQuery projects to scan')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
     
-    # Set debug level if requested
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Create system instance
-    system = CMDBDiscoverySystem(args.config)
+    system = BigQueryCMDBSystem(args.config)
     
-    # Disable resume if requested
-    if args.no_resume:
-        system.config['resume_enabled'] = False
+    # Override projects if specified
+    if args.projects:
+        system.config['bigquery']['projects'] = args.projects
     
-    # Run the system
-    success = await system.run(args.mode)
+    success = await system.run()
     
     if success:
-        logger.info("✅ Discovery completed successfully!")
-        sys.exit(0)
+        logger.info("✅ BigQuery CMDB Discovery completed successfully!")
     else:
         logger.error("❌ Discovery failed")
         sys.exit(1)
@@ -289,7 +251,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nShutdown requested")
+        print("\nInterrupted by user")
         sys.exit(0)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)

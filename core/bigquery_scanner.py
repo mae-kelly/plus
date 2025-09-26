@@ -1,10 +1,10 @@
 # core/bigquery_scanner.py
 """
-BigQuery Scanner - COMPLETELY REWRITTEN WITHOUT PANDAS/NUMPY - NO LIMITS
+BigQuery Scanner - FAST hostname-focused scanning without pandas/numpy
 """
 
 import asyncio
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple, Set
 import logging
 from datetime import datetime
 import re
@@ -12,6 +12,8 @@ import os
 import sys
 import json
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logger = logging.getLogger(__name__)
@@ -27,22 +29,55 @@ except ImportError:
 from core.bigquery_client_manager import BigQueryClientManager
 
 class BigQueryScanner:
-    """Scans BigQuery projects - NO PANDAS/NUMPY AT ALL - NO LIMITS"""
+    """FAST scanner that ONLY looks for hostname columns"""
     
     def __init__(self, config: Dict):
         self.config = config
         self.bq_config = config.get('bigquery', {})
         self.projects = self.bq_config.get('projects', [])
-        self.sample_percent = self.bq_config.get('sample_percent', 100)  # Default to 100%
-        self.max_rows_per_table = None  # NO LIMIT
-        self.datasets_filter = set(self.bq_config.get('datasets_filter', []))
-        self.tables_filter = set(self.bq_config.get('tables_filter', []))
+        
+        # Performance settings
+        self.max_workers = self.bq_config.get('max_workers', 10)  # Parallel table scanning
+        self.sample_size = 100  # Only get 100 samples per hostname column
+        self.scan_timeout = 5  # 5 seconds max per table
+        
+        # Hostname patterns - ONLY look for these
+        self.hostname_column_patterns = [
+            r'.*hostname.*',
+            r'.*host_name.*',
+            r'.*servername.*',
+            r'.*server_name.*',
+            r'.*machine_name.*',
+            r'.*computer_name.*',
+            r'.*node_name.*',
+            r'.*instance_name.*',
+            r'.*fqdn.*',
+            r'^host$',
+            r'^hosts$',
+            r'^server$',
+            r'^servers$',
+            r'^node$',
+            r'^nodes$',
+            r'^machine$',
+            r'^machines$',
+        ]
+        
+        # Results
+        self.tables_with_hosts = []
+        self.tables_without_hosts = []
+        self.hostname_training_data = defaultdict(list)
+        self.learned_patterns = []
+        
+        # Statistics
         self.projects_scanned = []
         self.datasets_scanned = 0
         self.tables_scanned = 0
-        self.rows_processed = 0
-        self.tables_with_errors = []
-        self.tables_with_hosts = []
+        self.hostname_columns_found = 0
+        self.unique_hostnames = set()
+        self.scan_start_time = None
+        self.scan_end_time = None
+        
+        # Client pool
         self.client_managers = {}
         
         if not BIGQUERY_AVAILABLE:
@@ -52,445 +87,364 @@ class BigQueryScanner:
             raise ValueError("No BigQuery projects configured")
         
         logger.info("=" * 80)
-        logger.info("🚀 BigQuery Scanner initialized (NO PANDAS, NO LIMITS MODE)")
+        logger.info("🚀 FAST BigQuery Hostname Scanner initialized")
         logger.info(f"📋 Projects to scan: {', '.join(self.projects)}")
-        logger.info("🔥 SCANNING ALL ROWS - NO LIMITS")
+        logger.info(f"⚡ Parallel workers: {self.max_workers}")
         logger.info("=" * 80)
     
     def _get_client(self, project_id: str) -> bigquery.Client:
         """Get or create BigQuery client"""
         if project_id not in self.client_managers:
-            logger.info(f"🔑 Creating BigQuery client for project: {project_id}")
             self.client_managers[project_id] = BigQueryClientManager(project_id=project_id)
-            if not self.client_managers[project_id].test_connection():
-                raise ConnectionError(f"Failed to connect to BigQuery project: {project_id}")
-            logger.info(f"✅ Connected to project: {project_id}")
         return self.client_managers[project_id].get_client()
     
-    def _convert_value(self, value):
-        """Convert ANY BigQuery value to a safe Python type"""
-        if value is None:
-            return None
-        elif isinstance(value, (list, tuple)):
-            # Convert lists/arrays to JSON string
-            return json.dumps([self._convert_value(v) for v in value])
-        elif isinstance(value, dict):
-            # Convert dicts/structs to JSON string
-            return json.dumps({k: self._convert_value(v) for k, v in value.items()})
-        elif isinstance(value, bytes):
-            return value.decode('utf-8', errors='ignore')
-        elif isinstance(value, (datetime, )):
-            return value.isoformat()
-        else:
-            # Everything else becomes a string
-            return str(value)
-    
     async def scan_all_projects(self) -> List[Dict]:
-        """Scan all configured BigQuery projects"""
+        """FAST scan - only look for hostname columns"""
+        self.scan_start_time = time.time()
         all_data = []
         
         logger.info("\n" + "="*80)
-        logger.info("📊 STARTING BIGQUERY SCAN (FULL SCAN - NO LIMITS)")
-        logger.info(f"🔍 Scanning {len(self.projects)} projects")
+        logger.info("📊 STARTING FAST HOSTNAME SCAN")
         logger.info("="*80)
         
         for project_idx, project_id in enumerate(self.projects, 1):
-            logger.info(f"\n{'='*60}")
-            logger.info(f"📂 PROJECT {project_idx}/{len(self.projects)}: {project_id}")
-            logger.info(f"{'='*60}")
+            logger.info(f"\n📂 PROJECT {project_idx}/{len(self.projects)}: {project_id}")
             
             try:
-                project_data = await self.scan_project(project_id)
+                project_data = await self.scan_project_fast(project_id)
                 all_data.extend(project_data)
                 self.projects_scanned.append(project_id)
-                logger.info(f"✅ Completed scanning project: {project_id}")
             except Exception as e:
                 logger.error(f"❌ Error scanning project {project_id}: {e}")
         
-        logger.info("\n" + "="*80)
-        logger.info("📊 SCAN SUMMARY")
-        logger.info(f"✅ Projects scanned: {len(self.projects_scanned)}/{len(self.projects)}")
-        logger.info(f"📁 Datasets scanned: {self.datasets_scanned}")
-        logger.info(f"📋 Tables scanned: {self.tables_scanned}")
-        logger.info(f"📝 Rows processed: {self.rows_processed:,}")
-        logger.info(f"🏠 Tables with potential hosts: {len(self.tables_with_hosts)}")
-        logger.info(f"⚠️  Tables with errors: {len(self.tables_with_errors)}")
-        logger.info("="*80)
+        self.scan_end_time = time.time()
+        
+        # Learn patterns from collected hostnames
+        if self.hostname_training_data:
+            self._learn_hostname_patterns()
+        
+        # Print summary
+        self._print_fast_summary()
         
         return all_data
     
-    async def scan_project(self, project_id: str) -> List[Dict]:
-        """Scan a single BigQuery project"""
+    async def scan_project_fast(self, project_id: str) -> List[Dict]:
+        """Fast scan a project - parallel table scanning"""
         client = self._get_client(project_id)
         project_data = []
         
         try:
-            logger.info(f"📁 Listing datasets in project {project_id}...")
+            # Get all datasets
             datasets = list(client.list_datasets(timeout=30))
-            
-            if not datasets:
-                logger.warning(f"  ⚠️ No datasets found in project {project_id}")
-                return project_data
-            
             logger.info(f"  ✅ Found {len(datasets)} datasets")
             
-            for dataset_idx, dataset_ref in enumerate(datasets, 1):
+            # Collect all tables
+            all_tables = []
+            for dataset_ref in datasets:
                 dataset_id = dataset_ref.dataset_id
+                tables = list(client.list_tables(f"{project_id}.{dataset_id}"))
+                for table in tables:
+                    all_tables.append((project_id, dataset_id, table.table_id))
+                self.datasets_scanned += 1
+            
+            logger.info(f"  📋 Found {len(all_tables)} tables to scan")
+            logger.info(f"  ⚡ Scanning with {self.max_workers} parallel workers...")
+            
+            # Process tables in parallel
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all scan jobs
+                future_to_table = {
+                    executor.submit(
+                        self._fast_scan_table_for_hostnames,
+                        client, project_id, dataset_id, table_id
+                    ): (project_id, dataset_id, table_id)
+                    for project_id, dataset_id, table_id in all_tables
+                }
                 
-                if self.datasets_filter and dataset_id not in self.datasets_filter:
-                    continue
-                
-                logger.info(f"\n  📁 DATASET {dataset_idx}/{len(datasets)}: {dataset_id}")
-                
-                dataset_data = await self.scan_dataset(client, project_id, dataset_id)
-                if dataset_data:
-                    project_data.extend(dataset_data)
-                    self.datasets_scanned += 1
+                # Process results as they complete
+                completed = 0
+                for future in as_completed(future_to_table):
+                    table_info = future_to_table[future]
+                    completed += 1
                     
+                    try:
+                        result = future.result(timeout=self.scan_timeout)
+                        
+                        if result:
+                            if result.get('has_hostnames'):
+                                project_data.append(result)
+                                table_name = f"{table_info[0]}.{table_info[1]}.{table_info[2]}"
+                                self.tables_with_hosts.append(table_name)
+                                
+                                # Collect training data
+                                for col_name, samples in result.get('hostname_samples', {}).items():
+                                    self.hostname_training_data[col_name].extend(samples)
+                                    self.unique_hostnames.update(samples)
+                                
+                                logger.info(f"    ✅ [{completed}/{len(all_tables)}] {table_info[2]} - "
+                                          f"FOUND {len(result.get('hostname_columns', []))} hostname columns")
+                            else:
+                                table_name = f"{table_info[0]}.{table_info[1]}.{table_info[2]}"
+                                self.tables_without_hosts.append(table_name)
+                        
+                        self.tables_scanned += 1
+                        
+                        # Progress update every 10 tables
+                        if completed % 10 == 0:
+                            elapsed = time.time() - self.scan_start_time
+                            rate = completed / elapsed if elapsed > 0 else 0
+                            logger.info(f"    ⏱️  Progress: {completed}/{len(all_tables)} tables "
+                                      f"({rate:.1f} tables/sec)")
+                    
+                    except Exception as e:
+                        logger.debug(f"    ⚠️ Timeout/error scanning {table_info[2]}: {str(e)[:50]}")
+                        self.tables_scanned += 1
+            
         except Exception as e:
-            logger.error(f"  ❌ Error listing datasets in {project_id}: {e}")
+            logger.error(f"  ❌ Error scanning project: {e}")
         
         return project_data
     
-    async def scan_dataset(self, client: bigquery.Client, project_id: str, dataset_id: str) -> List[Dict]:
-        """Scan all tables in a dataset"""
-        dataset_data = []
-        
-        try:
-            logger.info(f"    📋 Listing tables in {dataset_id}...")
-            tables = list(client.list_tables(f"{project_id}.{dataset_id}", timeout=30))
-            
-            if not tables:
-                logger.info(f"    ℹ️ No tables in dataset {dataset_id}")
-                return dataset_data
-            
-            logger.info(f"    ✅ Found {len(tables)} tables")
-            
-            for table_idx, table_ref in enumerate(tables, 1):
-                table_id = table_ref.table_id
-                
-                if self.tables_filter and table_id not in self.tables_filter:
-                    continue
-                
-                logger.info(f"\n      📋 TABLE {table_idx}/{len(tables)}: {table_id}")
-                
-                try:
-                    table_data = await self.scan_table(client, project_id, dataset_id, table_id)
-                    
-                    if table_data:
-                        # Check if table has potential hosts
-                        has_hosts = self._check_for_hosts(table_data)
-                        if has_hosts:
-                            logger.info(f"      🏠 Found potential hosts in {table_id}")
-                            self.tables_with_hosts.append(f"{project_id}.{dataset_id}.{table_id}")
-                        
-                        dataset_data.append({
-                            'type': 'bigquery',
-                            'source': f'{project_id}.{dataset_id}.{table_id}',
-                            'project': project_id,
-                            'dataset': dataset_id,
-                            'table': table_id,
-                            'tables': [table_data]
-                        })
-                        self.tables_scanned += 1
-                        logger.info(f"      ✅ Successfully scanned {table_id}")
-                        
-                except Exception as e:
-                    logger.error(f"      ❌ Error scanning table {table_id}: {e}")
-                    self.tables_with_errors.append(f"{project_id}.{dataset_id}.{table_id}")
-                    
-        except Exception as e:
-            logger.error(f"    ❌ Error scanning dataset {dataset_id}: {e}")
-        
-        return dataset_data
-    
-    async def scan_table(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
-        """
-        COMPLETELY REWRITTEN: Scan table without pandas/numpy, NO ROW LIMITS
-        """
+    def _fast_scan_table_for_hostnames(self, client: bigquery.Client, 
+                                       project_id: str, dataset_id: str, 
+                                       table_id: str) -> Optional[Dict]:
+        """Ultra-fast hostname column detection"""
         full_table_id = f"{project_id}.{dataset_id}.{table_id}"
         
         try:
-            # Get table metadata
+            # Step 1: Get schema ONLY
             table = client.get_table(full_table_id)
             
-            if table.num_rows == 0:
-                logger.info(f"        ℹ️ Table {table_id} is empty")
-                return None
+            # Step 2: Find hostname columns in schema (FAST)
+            hostname_columns = []
+            for field in table.schema:
+                col_lower = field.name.lower()
+                
+                # Check if column name matches hostname patterns
+                for pattern in self.hostname_column_patterns:
+                    if re.match(pattern, col_lower):
+                        hostname_columns.append(field.name)
+                        self.hostname_columns_found += 1
+                        break
             
-            logger.info(f"        📊 Table stats:")
-            logger.info(f"           Rows: {table.num_rows:,}")
-            logger.info(f"           Size: {table.num_bytes/1024/1024:.1f} MB")
-            logger.info(f"           Columns: {len(table.schema)}")
+            # Step 3: If no hostname columns, return immediately
+            if not hostname_columns:
+                return {'has_hostnames': False}
             
-            # Log column names
-            column_names = [field.name for field in table.schema]
-            logger.info(f"        📋 Columns: {', '.join(column_names[:10])}")
-            if len(column_names) > 10:
-                logger.info(f"           ... and {len(column_names)-10} more columns")
+            # Step 4: Sample ONLY hostname columns (FAST query)
+            hostname_samples = {}
             
-            # IMPORTANT: Build special query to handle arrays/structs
+            # Limit to first 3 hostname columns to keep query fast
+            columns_to_sample = hostname_columns[:3]
+            
+            # Build efficient query
             select_parts = []
-            complex_fields = []
+            for col in columns_to_sample:
+                select_parts.append(f"`{col}`")
             
-            for field in table.schema:
-                if field.mode == 'REPEATED' or field.field_type in ['RECORD', 'STRUCT', 'JSON', 'GEOGRAPHY', 'ARRAY']:
-                    # Convert complex types to JSON strings IN THE QUERY
-                    select_parts.append(f"TO_JSON_STRING({field.name}) AS {field.name}")
-                    complex_fields.append(field.name)
-                else:
-                    select_parts.append(field.name)
+            query = f"""
+            SELECT DISTINCT {', '.join(select_parts)}
+            FROM `{full_table_id}`
+            WHERE {columns_to_sample[0]} IS NOT NULL
+            LIMIT {self.sample_size}
+            """
             
-            if complex_fields:
-                logger.info(f"        ⚠️ Complex fields detected: {', '.join(complex_fields[:5])}")
-                logger.info(f"           Converting to JSON strings for safe processing")
-            
-            # Build query - NO LIMIT IF WE WANT ALL DATA
-            if self.sample_percent < 100:
-                # Use sampling
-                query = f"""
-                SELECT {', '.join(select_parts)}
-                FROM `{full_table_id}`
-                TABLESAMPLE SYSTEM ({self.sample_percent} PERCENT)
-                """
-                logger.info(f"        🎯 Sampling {self.sample_percent}% of data")
-            else:
-                # GET EVERYTHING
-                query = f"""
-                SELECT {', '.join(select_parts)}
-                FROM `{full_table_id}`
-                """
-                logger.info(f"        🔥 SCANNING ALL {table.num_rows:,} ROWS - NO LIMITS")
-            
-            logger.info(f"        ⏳ Executing query...")
-            
-            # Execute query
+            # Execute query with timeout
             query_job = client.query(query)
+            query_job.result(timeout=3)  # 3 second timeout
             
-            # CRITICAL: Process results WITHOUT pandas
-            rows = []
-            columns_data = defaultdict(list)
-            row_count = 0
+            # Collect samples
+            for row in query_job:
+                for col in columns_to_sample:
+                    value = row.get(col)
+                    if value and self._looks_like_hostname(str(value)):
+                        if col not in hostname_samples:
+                            hostname_samples[col] = []
+                        hostname_samples[col].append(str(value))
             
-            logger.info(f"        📥 Processing rows...")
-            
-            # Process in batches for memory efficiency
-            batch_size = 10000
-            batch = []
-            
-            for bq_row in query_job.result():
-                row_dict = {}
-                
-                # Convert EVERY field to safe Python types
-                for field in table.schema:
-                    field_name = field.name
-                    raw_value = bq_row.get(field_name)
-                    
-                    # Use our safe converter
-                    safe_value = self._convert_value(raw_value)
-                    
-                    row_dict[field_name] = safe_value
-                    
-                    # Store samples for analysis (first 1000)
-                    if len(columns_data[field_name]) < 1000:
-                        columns_data[field_name].append(safe_value)
-                
-                batch.append(row_dict)
-                row_count += 1
-                
-                # Process batches
-                if len(batch) >= batch_size:
-                    rows.extend(batch)
-                    batch = []
-                    
-                    if row_count % 50000 == 0:
-                        logger.info(f"        ... processed {row_count:,} rows")
-            
-            # Add remaining batch
-            if batch:
-                rows.extend(batch)
-            
-            logger.info(f"        ✅ Retrieved {row_count:,} rows")
-            
-            # Build columns metadata
-            columns = {}
-            for field in table.schema:
-                col_name = field.name
-                col_samples = columns_data.get(col_name, [])
-                
-                columns[col_name] = {
-                    'name': col_name,
-                    'type': field.field_type,
-                    'mode': field.mode,
-                    'samples': col_samples[:100],  # Keep first 100 samples
-                    'description': field.description,
-                    'statistics': self._analyze_column_safe(col_samples),
-                    'potential_type': self._infer_semantic_type_safe(col_name, col_samples)
-                }
-                
-                # Log interesting columns
-                if columns[col_name]['potential_type'] in ['hostname', 'ip_address']:
-                    logger.info(f"        🎯 Found {columns[col_name]['potential_type']} column: {col_name}")
-            
-            self.rows_processed += row_count
+            # Limit samples
+            for col in hostname_samples:
+                hostname_samples[col] = list(set(hostname_samples[col][:50]))
             
             return {
-                'name': table_id,
-                'full_name': full_table_id,
-                'rows': rows,
-                'columns': columns,
-                'row_count': row_count,
-                'total_rows': table.num_rows,
-                'created': str(table.created) if table.created else None,
-                'modified': str(table.modified) if table.modified else None,
-                'size_bytes': table.num_bytes,
-                'size_mb': round(table.num_bytes / 1024 / 1024, 2),
-                'description': table.description
+                'type': 'bigquery',
+                'source': full_table_id,
+                'has_hostnames': True,
+                'hostname_columns': hostname_columns,
+                'hostname_samples': hostname_samples,
+                'tables': [{
+                    'name': table_id,
+                    'full_name': full_table_id,
+                    'columns': {col: {'name': col, 'type': 'hostname'} for col in hostname_columns},
+                    'row_count': table.num_rows
+                }]
             }
             
         except Exception as e:
-            logger.error(f"        ❌ Error scanning table {full_table_id}")
-            logger.error(f"           Error type: {type(e).__name__}")
-            logger.error(f"           Error: {e}")
-            import traceback
-            logger.error(f"           Traceback: {traceback.format_exc()}")
-            raise
+            # Silent fail - just log debug
+            logger.debug(f"Could not scan {table_id}: {str(e)[:100]}")
+            return None
     
-    def _check_for_hosts(self, table_data: Dict) -> bool:
-        """Check if table likely contains host information"""
-        columns = table_data.get('columns', {})
+    def _looks_like_hostname(self, value: str) -> bool:
+        """Quick check if value looks like a hostname"""
+        if not value or len(value) > 253:
+            return False
         
-        for col_name, col_info in columns.items():
-            if col_info.get('potential_type') in ['hostname', 'ip_address']:
-                return True
+        # Quick rejections
+        if ' ' in value or '\n' in value or '\t' in value:
+            return False
+        
+        # Basic hostname pattern
+        if re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$', value):
+            return True
+        
+        # IP address pattern
+        if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', value):
+            return True
         
         return False
     
-    def _analyze_column_safe(self, samples: List[Any]) -> Dict:
-        """Analyze column samples safely (all values are already strings or None)"""
-        if not samples:
-            return {}
+    def _learn_hostname_patterns(self):
+        """Learn patterns from collected hostname data"""
+        logger.info("\n🧠 Learning hostname patterns from collected data...")
         
-        # Filter out None values
-        non_null = []
-        for s in samples:
-            if s is not None:
-                # If it's a JSON string, try to extract first element
-                if isinstance(s, str) and (s.startswith('[') or s.startswith('{')):
-                    try:
-                        parsed = json.loads(s)
-                        if isinstance(parsed, list) and parsed:
-                            non_null.append(str(parsed[0]))
-                        else:
-                            non_null.append(s)
-                    except:
-                        non_null.append(s)
-                else:
-                    non_null.append(str(s))
+        all_hostnames = list(self.unique_hostnames)[:1000]  # Sample for pattern learning
         
-        if not non_null:
-            return {'all_null': True}
+        patterns = defaultdict(int)
         
-        stats = {
-            'count': len(samples),
-            'unique': len(set(non_null)),
-            'null_count': len(samples) - len(non_null),
-            'unique_ratio': len(set(non_null)) / len(non_null) if non_null else 0
+        for hostname in all_hostnames:
+            # Hyphenated patterns
+            if '-' in hostname:
+                parts = hostname.split('-')
+                patterns[f'hyphenated_{len(parts)}_parts'] += 1
+                
+                # Check for environment prefixes
+                if parts[0].lower() in ['prod', 'dev', 'test', 'qa', 'uat', 'stg']:
+                    patterns[f'env_prefix_{parts[0].lower()}'] += 1
+            
+            # FQDN patterns
+            if '.' in hostname:
+                parts = hostname.split('.')
+                patterns[f'fqdn_{len(parts)}_levels'] += 1
+            
+            # Cloud provider patterns
+            if hostname.startswith('i-') and len(hostname) > 10:
+                patterns['aws_instance_pattern'] += 1
+            elif re.match(r'^[a-z]+-[a-z0-9]+-[a-z0-9]+', hostname):
+                patterns['gcp_instance_pattern'] += 1
+            
+            # Numbered patterns
+            if re.search(r'\d+$', hostname):
+                patterns['numbered_suffix'] += 1
+            
+            # Length patterns
+            if len(hostname) < 10:
+                patterns['short_hostname'] += 1
+            elif len(hostname) > 30:
+                patterns['long_hostname'] += 1
+        
+        # Store learned patterns
+        self.learned_patterns = [
+            {'pattern': k, 'count': v, 'frequency': v/len(all_hostnames)}
+            for k, v in patterns.items()
+            if v >= 2  # Pattern must appear at least twice
+        ]
+        
+        # Sort by frequency
+        self.learned_patterns.sort(key=lambda x: x['frequency'], reverse=True)
+        
+        logger.info(f"  ✅ Learned {len(self.learned_patterns)} hostname patterns")
+        
+        # Show top patterns
+        for pattern in self.learned_patterns[:5]:
+            logger.info(f"    • {pattern['pattern']}: {pattern['frequency']:.1%} "
+                       f"({pattern['count']} occurrences)")
+    
+    def _print_fast_summary(self):
+        """Print scan summary"""
+        duration = self.scan_end_time - self.scan_start_time if self.scan_end_time else 0
+        tables_per_sec = self.tables_scanned / duration if duration > 0 else 0
+        
+        print("\n" + "="*80)
+        print("FAST HOSTNAME SCAN COMPLETE")
+        print("="*80)
+        print(f"⏱️  Duration:                 {duration:.1f} seconds")
+        print(f"⚡ Speed:                    {tables_per_sec:.1f} tables/second")
+        print("-"*80)
+        print(f"📊 Projects Scanned:         {len(self.projects_scanned)}")
+        print(f"📁 Datasets Scanned:         {self.datasets_scanned}")
+        print(f"📋 Tables Scanned:           {self.tables_scanned}")
+        print("-"*80)
+        print(f"✅ Tables WITH hostnames:    {len(self.tables_with_hosts)}")
+        print(f"❌ Tables WITHOUT hostnames: {len(self.tables_without_hosts)}")
+        print(f"🎯 Hostname columns found:   {self.hostname_columns_found}")
+        print(f"🔤 Unique hostnames:         {len(self.unique_hostnames)}")
+        print(f"🧠 Patterns learned:         {len(self.learned_patterns)}")
+        print("="*80)
+        
+        # Show sample tables with hostnames
+        if self.tables_with_hosts:
+            print("\nSample Tables with Hostnames:")
+            for table in self.tables_with_hosts[:5]:
+                print(f"  • {table}")
+        
+        # Show sample hostnames for training
+        if self.unique_hostnames:
+            print("\nSample Hostnames for Training:")
+            for hostname in list(self.unique_hostnames)[:10]:
+                print(f"  • {hostname}")
+    
+    def get_training_data(self) -> Dict:
+        """Get hostname training data for ML models"""
+        return {
+            'hostnames': list(self.unique_hostnames),
+            'hostname_columns': list(self.hostname_training_data.keys()),
+            'patterns': self.learned_patterns,
+            'tables_with_hosts': self.tables_with_hosts,
+            'column_samples': dict(self.hostname_training_data)
+        }
+    
+    def export_results(self, filepath: str = 'hostname_scan_results.json'):
+        """Export scan results"""
+        results = {
+            'scan_timestamp': datetime.now().isoformat(),
+            'duration_seconds': self.scan_end_time - self.scan_start_time if self.scan_end_time else 0,
+            'statistics': {
+                'projects_scanned': len(self.projects_scanned),
+                'datasets_scanned': self.datasets_scanned,
+                'tables_scanned': self.tables_scanned,
+                'tables_with_hostnames': len(self.tables_with_hosts),
+                'tables_without_hostnames': len(self.tables_without_hosts),
+                'hostname_columns_found': self.hostname_columns_found,
+                'unique_hostnames': len(self.unique_hostnames),
+                'patterns_learned': len(self.learned_patterns)
+            },
+            'tables_with_hosts': self.tables_with_hosts[:100],  # Limit for file size
+            'learned_patterns': self.learned_patterns[:20],
+            'sample_hostnames': list(self.unique_hostnames)[:100]
         }
         
-        # Check for patterns
-        if non_null:
-            # Check for IP addresses
-            ip_pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
-            ip_matches = 0
-            for s in non_null:
-                try:
-                    if re.match(ip_pattern, s):
-                        ip_matches += 1
-                except:
-                    pass
-            stats['ip_likelihood'] = ip_matches / len(non_null) if non_null else 0
-            
-            # Check for hostnames/FQDNs
-            hostname_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$'
-            hostname_matches = 0
-            for s in non_null:
-                try:
-                    if re.match(hostname_pattern, s) and '.' in s:
-                        hostname_matches += 1
-                except:
-                    pass
-            stats['hostname_likelihood'] = hostname_matches / len(non_null) if non_null else 0
+        with open(filepath, 'w') as f:
+            json.dump(results, f, indent=2)
         
-        return stats
-    
-    def _infer_semantic_type_safe(self, column_name: str, samples: List[Any]) -> str:
-        """Infer semantic type (all values are already safe strings or None)"""
-        col_lower = column_name.lower()
+        logger.info(f"📁 Results exported to {filepath}")
         
-        # Check column name patterns
-        if any(pattern in col_lower for pattern in ['hostname', 'host_name', 'fqdn', 'servername', 'server_name']):
-            return 'hostname'
-        elif 'ip' in col_lower and any(pattern in col_lower for pattern in ['address', 'addr']):
-            return 'ip_address'
-        elif any(pattern in col_lower for pattern in ['environment', 'env']):
-            return 'environment'
-        elif any(pattern in col_lower for pattern in ['application', 'app', 'service']):
-            return 'application'
-        
-        # Check sample data patterns
-        if samples:
-            non_null = []
-            for s in samples[:100]:
-                if s is not None:
-                    # Handle JSON strings
-                    if isinstance(s, str) and (s.startswith('[') or s.startswith('{')):
-                        try:
-                            parsed = json.loads(s)
-                            if isinstance(parsed, list) and parsed:
-                                non_null.append(str(parsed[0]))
-                            else:
-                                non_null.append(s)
-                        except:
-                            non_null.append(s)
-                    else:
-                        non_null.append(str(s))
-            
-            if non_null:
-                # Check for IP pattern
-                ip_matches = 0
-                for s in non_null:
-                    try:
-                        if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', s):
-                            ip_matches += 1
-                    except:
-                        pass
-                
-                if ip_matches > len(non_null) * 0.8:
-                    return 'ip_address'
-                
-                # Check for hostname/FQDN pattern
-                hostname_matches = 0
-                for s in non_null:
-                    try:
-                        if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', s) and '.' in s:
-                            hostname_matches += 1
-                    except:
-                        pass
-                
-                if hostname_matches > len(non_null) * 0.6:
-                    return 'hostname'
-        
-        return 'unknown'
+        return results
     
     def get_statistics(self) -> Dict:
         """Get scanning statistics"""
+        duration = self.scan_end_time - self.scan_start_time if self.scan_end_time else 0
+        
         return {
             'projects_scanned': len(self.projects_scanned),
             'projects_list': self.projects_scanned,
             'datasets_scanned': self.datasets_scanned,
             'tables_scanned': self.tables_scanned,
-            'rows_processed': self.rows_processed,
             'tables_with_hosts': self.tables_with_hosts,
-            'tables_with_errors': self.tables_with_errors
+            'tables_without_hosts': self.tables_without_hosts[:100],  # Limit list size
+            'hostname_columns_found': self.hostname_columns_found,
+            'unique_hostnames_count': len(self.unique_hostnames),
+            'patterns_learned': len(self.learned_patterns),
+            'scan_duration_seconds': duration,
+            'tables_per_second': self.tables_scanned / duration if duration > 0 else 0
         }

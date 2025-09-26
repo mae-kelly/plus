@@ -13,8 +13,21 @@ from processors.entity_resolver import EntityResolver
 from processors.graph_builder import GraphBuilder
 from processors.context_analyzer import ContextAnalyzer
 from storage.cmdb_builder import CMDBBuilder
-from storage.metadata_store import MetadataStore
-from storage.streaming_handler import StreamingHandler
+
+# Conditional imports for optional components
+try:
+    from storage.metadata_store import MetadataStore
+    METADATA_STORE_AVAILABLE = True
+except ImportError:
+    METADATA_STORE_AVAILABLE = False
+    logging.debug("MetadataStore not available (missing dependencies)")
+
+try:
+    from storage.streaming_handler import StreamingHandler
+    STREAMING_AVAILABLE = True
+except ImportError:
+    STREAMING_AVAILABLE = False
+    logging.debug("StreamingHandler not available (missing dependencies)")
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +45,21 @@ class AdvancedOrchestrator:
         self.graph_builder = GraphBuilder()
         self.context_analyzer = ContextAnalyzer(device)
         self.cmdb = CMDBBuilder(config['storage']['duckdb_path'])
-        self.metadata_store = MetadataStore(config)
-        self.streaming = StreamingHandler(config) if config['storage']['streaming_enabled'] else None
+        
+        # Optional components
+        self.metadata_store = None
+        if METADATA_STORE_AVAILABLE and (config['storage'].get('elasticsearch_host') or config['storage'].get('neo4j_uri')):
+            try:
+                self.metadata_store = MetadataStore(config)
+            except Exception as e:
+                logger.warning(f"Could not initialize MetadataStore: {e}")
+        
+        self.streaming = None
+        if STREAMING_AVAILABLE and config['storage'].get('streaming_enabled'):
+            try:
+                self.streaming = StreamingHandler(config)
+            except Exception as e:
+                logger.warning(f"Could not initialize StreamingHandler: {e}")
         
         self.executor = ThreadPoolExecutor(max_workers=config['max_workers'])
         self.discovered_hosts = {}
@@ -45,6 +71,9 @@ class AdvancedOrchestrator:
             'columns_classified': 0,
             'entities_resolved': 0
         }
+        
+        # Add shutdown flag
+        self.shutdown_requested = False
     
     async def execute(self):
         logger.info("Starting advanced CMDB discovery")
@@ -154,7 +183,18 @@ class AdvancedOrchestrator:
             await self.cmdb.insert_hosts(host_batch)
         
         await self.cmdb.create_indexes()
-        await self.metadata_store.persist_metadata(self.column_metadata)
+        
+        # Only persist to metadata store if available
+        if self.metadata_store:
+            await self.metadata_store.persist_metadata(self.column_metadata)
+        else:
+            # Save to local file as fallback
+            import json
+            with open('metadata.json', 'w') as f:
+                json.dump({
+                    'columns': list(self.column_metadata.keys()),
+                    'statistics': self.statistics
+                }, f, indent=2)
     
     async def _extract_features(self, batch):
         features = {}

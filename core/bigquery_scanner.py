@@ -242,27 +242,6 @@ class BigQueryScanner:
                     logger.error(f"         Error: {error_msg}")
                     self.tables_with_errors.append(f"{project_id}.{dataset_id}.{table_id}")
                     
-                    # Handle specific errors
-                    if "ambiguous" in error_msg.lower():
-                        logger.info(f"      ℹ️ Retrying with NA-safe method...")
-                        try:
-                            table_data = await self._scan_table_safe(
-                                client, project_id, dataset_id, table_id
-                            )
-                            if table_data:
-                                dataset_data.append({
-                                    'type': 'bigquery',
-                                    'source': f'{project_id}.{dataset_id}.{table_id}',
-                                    'project': project_id,
-                                    'dataset': dataset_id,
-                                    'table': table_id,
-                                    'tables': [table_data]
-                                })
-                                self.tables_scanned += 1
-                                logger.info(f"      ✅ Successfully scanned {table_id} with safe method")
-                        except Exception as e2:
-                            logger.error(f"      ❌ Retry failed: {e2}")
-                    
         except exceptions.Forbidden as e:
             logger.error(f"    ❌ Permission denied listing tables in {dataset_id}")
             
@@ -319,29 +298,19 @@ class BigQueryScanner:
             
             logger.info(f"        ⏳ Executing query...")
             
-            # Execute query
+            # Execute query with timeout
             query_job = client.query(query)
             
-            # Get results as iterator of Row objects to avoid DataFrame issues
-            rows_iterator = query_job.result()
+            # Convert to pandas DataFrame for easier handling
+            df = query_job.to_dataframe()
             
-            # Convert to list of dictionaries
-            rows = []
-            columns_data = defaultdict(list)
+            # CRITICAL FIX: Replace all NA values with None to avoid ambiguity
+            # This is the key fix for the "boolean value of NA is ambiguous" error
+            df = df.fillna(value=np.nan)  # First convert pandas NA to numpy nan
+            df = df.replace({np.nan: None})  # Then convert numpy nan to None
             
-            for row in rows_iterator:
-                row_dict = {}
-                for field in table.schema:
-                    field_name = field.name
-                    value = row.get(field_name)
-                    
-                    # Clean the value - handle all types safely
-                    cleaned_value = self._clean_value(value)
-                    
-                    row_dict[field_name] = cleaned_value
-                    columns_data[field_name].append(cleaned_value)
-                
-                rows.append(row_dict)
+            # Convert to records
+            rows = df.to_dict('records')
             
             if not rows:
                 logger.warning(f"        ⚠️ No rows returned from {table_id}")
@@ -349,12 +318,29 @@ class BigQueryScanner:
             
             logger.info(f"        ✅ Retrieved {len(rows)} rows")
             
-            # Build columns metadata
+            # Convert to standard format
             columns = {}
             
+            # Process columns
             for field in table.schema:
                 col_name = field.name
-                col_values = columns_data.get(col_name, [])
+                
+                if col_name in df.columns:
+                    # Get column values and ensure no NA issues
+                    col_series = df[col_name]
+                    
+                    # Convert to list, replacing any remaining NA values
+                    col_values = []
+                    for val in col_series:
+                        if pd.isna(val):
+                            col_values.append(None)
+                        elif isinstance(val, (np.ndarray, pd.Series)):
+                            # Convert arrays to lists
+                            col_values.append(val.tolist() if hasattr(val, 'tolist') else list(val))
+                        else:
+                            col_values.append(val)
+                else:
+                    col_values = []
                 
                 columns[col_name] = {
                     'name': col_name,
@@ -392,141 +378,7 @@ class BigQueryScanner:
             logger.error(f"        ❌ Error scanning table {full_table_id}")
             logger.error(f"           Error type: {type(e).__name__}")
             logger.error(f"           Error: {e}")
-            
-            # If it's the specific NA error, try alternative method
-            if "ambiguous" in str(e).lower():
-                logger.info(f"        ℹ️ Retrying with NA-safe method...")
-                return await self._scan_table_safe(client, project_id, dataset_id, table_id)
-            else:
-                raise
-    
-    def _clean_value(self, value):
-        """Clean a single value, handling all types safely"""
-        # Handle None
-        if value is None:
-            return None
-        
-        # Handle pandas NA or numpy nan
-        try:
-            # Check if it's a scalar that might be NA
-            if hasattr(value, '__len__') and not isinstance(value, (str, bytes)):
-                # It's array-like, convert to list
-                if hasattr(value, 'tolist'):
-                    return value.tolist()
-                else:
-                    return list(value)
-            
-            # For scalar values, check if it's NA without using ambiguous operations
-            # Use pandas isna in a safe way
-            if isinstance(value, float) and np.isnan(value):
-                return None
-        except (TypeError, ValueError):
-            # If checking for NA fails, it's probably a valid value
-            pass
-        
-        # Handle numpy types
-        if hasattr(value, 'item'):
-            try:
-                return value.item()
-            except:
-                pass
-        
-        # Handle bytes
-        if isinstance(value, bytes):
-            return value.decode('utf-8', errors='ignore')
-        
-        # Return as-is if no special handling needed
-        return value
-    
-    async def _scan_table_safe(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
-        """Safe table scanning method that avoids pandas DataFrame and NA issues"""
-        full_table_id = f"{project_id}.{dataset_id}.{table_id}"
-        
-        try:
-            table = client.get_table(full_table_id)
-            
-            if table.num_rows == 0:
-                return None
-            
-            # Use smaller sample for problematic tables
-            sample_size = min(500, table.num_rows)
-            
-            query = f"""
-            SELECT *
-            FROM `{full_table_id}`
-            LIMIT {sample_size}
-            """
-            
-            query_job = client.query(query)
-            rows_iterator = query_job.result()
-            
-            # Process without pandas
-            rows = []
-            columns = defaultdict(lambda: {
-                'samples': [],
-                'name': '',
-                'type': '',
-                'mode': '',
-                'description': ''
-            })
-            
-            for row in rows_iterator:
-                row_dict = {}
-                for field in table.schema:
-                    field_name = field.name
-                    value = row.get(field_name)
-                    
-                    # Simple cleaning without pandas
-                    if value is None:
-                        cleaned_value = None
-                    elif isinstance(value, (list, tuple)):
-                        cleaned_value = list(value)
-                    elif isinstance(value, bytes):
-                        cleaned_value = value.decode('utf-8', errors='ignore')
-                    elif isinstance(value, float) and np.isnan(value):
-                        cleaned_value = None
-                    else:
-                        cleaned_value = value
-                    
-                    row_dict[field_name] = cleaned_value
-                    
-                    # Store column info
-                    if not columns[field_name]['name']:
-                        columns[field_name]['name'] = field_name
-                        columns[field_name]['type'] = field.field_type
-                        columns[field_name]['mode'] = field.mode
-                        columns[field_name]['description'] = field.description
-                    
-                    # Store samples
-                    if len(columns[field_name]['samples']) < 100 and cleaned_value is not None:
-                        columns[field_name]['samples'].append(cleaned_value)
-                
-                rows.append(row_dict)
-            
-            # Analyze columns
-            for col_name, col_info in columns.items():
-                col_info['statistics'] = self._analyze_column(col_info['samples'])
-                col_info['potential_type'] = self._infer_semantic_type(col_name, col_info['samples'])
-            
-            self.rows_processed += len(rows)
-            
-            return {
-                'name': table_id,
-                'full_name': full_table_id,
-                'rows': rows,
-                'columns': dict(columns),
-                'row_count': len(rows),
-                'total_rows': table.num_rows,
-                'created': str(table.created) if table.created else None,
-                'modified': str(table.modified) if table.modified else None,
-                'size_bytes': table.num_bytes,
-                'size_mb': round(table.num_bytes / 1024 / 1024, 2),
-                'description': table.description
-            }
-            
-        except Exception as e:
-            logger.error(f"Safe scan also failed for {full_table_id}: {e}")
-            return None
+            raise
     
     def _check_for_hosts(self, table_data: Dict) -> bool:
         """Check if table likely contains host information"""
@@ -543,8 +395,11 @@ class BigQueryScanner:
         if not samples:
             return {}
         
-        # Filter out None values
-        non_null = [s for s in samples if s is not None]
+        # Filter out None values safely
+        non_null = []
+        for s in samples:
+            if s is not None:
+                non_null.append(s)
         
         if not non_null:
             return {'all_null': True}
@@ -560,12 +415,24 @@ class BigQueryScanner:
         if non_null:
             # Check for IP addresses
             ip_pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
-            ip_matches = sum(1 for s in non_null if re.match(ip_pattern, str(s)))
+            ip_matches = 0
+            for s in non_null:
+                try:
+                    if re.match(ip_pattern, str(s)):
+                        ip_matches += 1
+                except:
+                    pass
             stats['ip_likelihood'] = ip_matches / len(non_null) if non_null else 0
             
             # Check for hostnames/FQDNs
             hostname_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$'
-            hostname_matches = sum(1 for s in non_null if re.match(hostname_pattern, str(s)) and '.' in str(s))
+            hostname_matches = 0
+            for s in non_null:
+                try:
+                    if re.match(hostname_pattern, str(s)) and '.' in str(s):
+                        hostname_matches += 1
+                except:
+                    pass
             stats['hostname_likelihood'] = hostname_matches / len(non_null) if non_null else 0
         
         return stats
@@ -586,18 +453,34 @@ class BigQueryScanner:
         
         # Check sample data patterns if column name doesn't match
         if samples:
-            non_null = [s for s in samples[:100] if s is not None]
+            non_null = []
+            for s in samples[:100]:
+                if s is not None:
+                    non_null.append(s)
+            
             if non_null:
                 # Check for IP pattern
-                ip_matches = sum(1 for s in non_null 
-                                if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', str(s)))
+                ip_matches = 0
+                for s in non_null:
+                    try:
+                        if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', str(s)):
+                            ip_matches += 1
+                    except:
+                        pass
+                
                 if ip_matches > len(non_null) * 0.8:
                     return 'ip_address'
                 
                 # Check for hostname/FQDN pattern
-                hostname_matches = sum(1 for s in non_null 
-                                     if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', str(s))
-                                     and '.' in str(s))
+                hostname_matches = 0
+                for s in non_null:
+                    try:
+                        s_str = str(s)
+                        if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', s_str) and '.' in s_str:
+                            hostname_matches += 1
+                    except:
+                        pass
+                
                 if hostname_matches > len(non_null) * 0.6:
                     return 'hostname'
         

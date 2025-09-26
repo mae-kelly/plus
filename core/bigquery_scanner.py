@@ -1,6 +1,6 @@
 # core/bigquery_scanner.py
 """
-BigQuery Scanner - Enhanced with detailed logging and NA handling
+BigQuery Scanner - Enhanced with detailed logging and NA/Array handling
 """
 
 import asyncio
@@ -13,6 +13,7 @@ import sys
 import pandas as pd
 import numpy as np
 from collections import defaultdict
+import json
 
 # Add parent directory to path to import BigQueryClientManager
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -85,6 +86,58 @@ class BigQueryScanner:
             logger.info(f"✅ Connected to project: {project_id}")
         
         return self.client_managers[project_id].get_client()
+    
+    def _safe_convert_value(self, value):
+        """Safely convert any value, handling arrays, NA, and complex types"""
+        # Handle None
+        if value is None:
+            return None
+        
+        # Handle pandas NA
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            # pd.isna() failed, probably an array
+            pass
+        
+        # Handle numpy arrays and pandas Series
+        if isinstance(value, (np.ndarray, pd.Series)):
+            # Convert to list and recursively clean
+            if hasattr(value, 'tolist'):
+                list_val = value.tolist()
+            else:
+                list_val = list(value)
+            # Recursively clean list elements
+            return [self._safe_convert_value(v) for v in list_val]
+        
+        # Handle lists (including repeated fields from BigQuery)
+        if isinstance(value, list):
+            return [self._safe_convert_value(v) for v in value]
+        
+        # Handle dicts (STRUCT fields from BigQuery)
+        if isinstance(value, dict):
+            return {k: self._safe_convert_value(v) for k, v in value.items()}
+        
+        # Handle numpy scalar types
+        if hasattr(value, 'item'):
+            try:
+                return value.item()
+            except:
+                pass
+        
+        # Handle bytes
+        if isinstance(value, bytes):
+            return value.decode('utf-8', errors='ignore')
+        
+        # Handle floats that might be NaN
+        if isinstance(value, float):
+            if np.isnan(value):
+                return None
+            return value
+        
+        # Return as-is for other types (int, str, etc.)
+        return value
     
     async def scan_all_projects(self) -> List[Dict]:
         """Scan all configured BigQuery projects"""
@@ -301,16 +354,26 @@ class BigQueryScanner:
             # Execute query with timeout
             query_job = client.query(query)
             
-            # Convert to pandas DataFrame for easier handling
+            # Convert to pandas DataFrame
             df = query_job.to_dataframe()
             
-            # CRITICAL FIX: Replace all NA values with None to avoid ambiguity
-            # This is the key fix for the "boolean value of NA is ambiguous" error
-            df = df.fillna(value=np.nan)  # First convert pandas NA to numpy nan
-            df = df.replace({np.nan: None})  # Then convert numpy nan to None
+            # CRITICAL FIX: Process DataFrame to handle arrays and NA values
+            # Process each column to fix array and NA issues
+            for col in df.columns:
+                # Apply safe conversion to entire column
+                df[col] = df[col].apply(self._safe_convert_value)
             
-            # Convert to records
+            # Now convert to records - all values should be safe
             rows = df.to_dict('records')
+            
+            # Additional safety: clean the rows dict
+            cleaned_rows = []
+            for row in rows:
+                cleaned_row = {}
+                for key, value in row.items():
+                    cleaned_row[key] = self._safe_convert_value(value)
+                cleaned_rows.append(cleaned_row)
+            rows = cleaned_rows
             
             if not rows:
                 logger.warning(f"        ⚠️ No rows returned from {table_id}")
@@ -326,19 +389,11 @@ class BigQueryScanner:
                 col_name = field.name
                 
                 if col_name in df.columns:
-                    # Get column values and ensure no NA issues
-                    col_series = df[col_name]
-                    
-                    # Convert to list, replacing any remaining NA values
+                    # Get column values safely
                     col_values = []
-                    for val in col_series:
-                        if pd.isna(val):
-                            col_values.append(None)
-                        elif isinstance(val, (np.ndarray, pd.Series)):
-                            # Convert arrays to lists
-                            col_values.append(val.tolist() if hasattr(val, 'tolist') else list(val))
-                        else:
-                            col_values.append(val)
+                    for val in df[col_name]:
+                        cleaned_val = self._safe_convert_value(val)
+                        col_values.append(cleaned_val)
                 else:
                     col_values = []
                 
@@ -399,7 +454,13 @@ class BigQueryScanner:
         non_null = []
         for s in samples:
             if s is not None:
-                non_null.append(s)
+                # Handle lists/arrays in samples
+                if isinstance(s, list):
+                    # For arrays, analyze the first element or treat as JSON
+                    if s:
+                        non_null.append(str(s[0]))
+                else:
+                    non_null.append(s)
         
         if not non_null:
             return {'all_null': True}
@@ -429,7 +490,8 @@ class BigQueryScanner:
             hostname_matches = 0
             for s in non_null:
                 try:
-                    if re.match(hostname_pattern, str(s)) and '.' in str(s):
+                    s_str = str(s)
+                    if re.match(hostname_pattern, s_str) and '.' in s_str:
                         hostname_matches += 1
                 except:
                     pass
@@ -456,7 +518,12 @@ class BigQueryScanner:
             non_null = []
             for s in samples[:100]:
                 if s is not None:
-                    non_null.append(s)
+                    # Handle arrays
+                    if isinstance(s, list):
+                        if s:
+                            non_null.append(str(s[0]))
+                    else:
+                        non_null.append(s)
             
             if non_null:
                 # Check for IP pattern

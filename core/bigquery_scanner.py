@@ -1,6 +1,6 @@
 # core/bigquery_scanner.py
 """
-BigQuery Scanner - Enhanced with detailed logging and NA/Array handling
+BigQuery Scanner - Enhanced with multiple fallback approaches for handling arrays/NA
 """
 
 import asyncio
@@ -10,10 +10,8 @@ from datetime import datetime
 import re
 import os
 import sys
-import pandas as pd
-import numpy as np
-from collections import defaultdict
 import json
+from collections import defaultdict
 
 # Add parent directory to path to import BigQueryClientManager
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,6 +57,9 @@ class BigQueryScanner:
         # Client managers for each project
         self.client_managers = {}
         
+        # Track which approach worked for each table
+        self.successful_approaches = {}
+        
         # Validate setup
         if not BIGQUERY_AVAILABLE:
             raise ImportError("google-cloud-bigquery is required. Install it with: pip install google-cloud-bigquery")
@@ -102,30 +103,14 @@ class BigQueryScanner:
             logger.info(f"{'='*60}")
             
             try:
-                # Get project info
-                if project_id in self.client_managers:
-                    project_info = self.client_managers[project_id].get_project_info()
-                    logger.info(f"✅ Connected to: {project_info.get('friendly_name', project_id)}")
-                
                 project_data = await self.scan_project(project_id)
                 all_data.extend(project_data)
                 self.projects_scanned.append(project_id)
                 
                 logger.info(f"✅ Completed scanning project: {project_id}")
                 
-            except exceptions.Forbidden as e:
-                logger.error(f"❌ Permission denied for project {project_id}")
-                logger.error(f"   Error: {e}")
-                logger.error(f"   Make sure your credentials have 'BigQuery Data Viewer' role")
-                
-            except ConnectionError as e:
-                logger.error(f"❌ Connection failed for project {project_id}")
-                logger.error(f"   Error: {e}")
-                
             except Exception as e:
-                logger.error(f"❌ Unexpected error scanning project {project_id}")
-                logger.error(f"   Error type: {type(e).__name__}")
-                logger.error(f"   Error: {e}")
+                logger.error(f"❌ Error scanning project {project_id}: {e}")
         
         # Final summary
         logger.info("\n" + "="*80)
@@ -136,14 +121,17 @@ class BigQueryScanner:
         logger.info(f"📝 Rows processed: {self.rows_processed:,}")
         logger.info(f"🏠 Tables with potential hosts: {len(self.tables_with_hosts)}")
         logger.info(f"⚠️  Tables with errors: {len(self.tables_with_errors)}")
-        logger.info("="*80)
         
-        if not self.projects_scanned:
-            logger.error("❌ No projects were successfully scanned!")
-            logger.error("Please check:")
-            logger.error("1. Your project IDs in config.json are correct")
-            logger.error("2. Your credentials have BigQuery access")
-            logger.error("3. The authentication is properly configured")
+        # Report successful approaches
+        if self.successful_approaches:
+            logger.info("\n📊 Successful scanning approaches used:")
+            approach_counts = defaultdict(int)
+            for approach in self.successful_approaches.values():
+                approach_counts[approach] += 1
+            for approach, count in approach_counts.items():
+                logger.info(f"   {approach}: {count} tables")
+        
+        logger.info("="*80)
         
         return all_data
     
@@ -152,7 +140,6 @@ class BigQueryScanner:
         client = self._get_client(project_id)
         project_data = []
         
-        # List datasets
         try:
             logger.info(f"📁 Listing datasets in project {project_id}...")
             datasets = list(client.list_datasets(timeout=30))
@@ -166,24 +153,16 @@ class BigQueryScanner:
             for dataset_idx, dataset_ref in enumerate(datasets, 1):
                 dataset_id = dataset_ref.dataset_id
                 
-                # Apply filter
                 if self.datasets_filter and dataset_id not in self.datasets_filter:
-                    logger.debug(f"  Skipping dataset {dataset_id} (not in filter)")
                     continue
                 
-                logger.info(f"\n  {'='*50}")
-                logger.info(f"  📁 DATASET {dataset_idx}/{len(datasets)}: {dataset_id}")
-                logger.info(f"  {'='*50}")
+                logger.info(f"\n  📁 DATASET {dataset_idx}/{len(datasets)}: {dataset_id}")
                 
                 dataset_data = await self.scan_dataset(client, project_id, dataset_id)
                 if dataset_data:
                     project_data.extend(dataset_data)
                     self.datasets_scanned += 1
                     
-        except exceptions.Forbidden as e:
-            logger.error(f"  ❌ Permission denied listing datasets in {project_id}")
-            logger.error(f"     Need 'bigquery.datasets.get' permission")
-            
         except Exception as e:
             logger.error(f"  ❌ Error listing datasets in {project_id}: {e}")
         
@@ -194,7 +173,6 @@ class BigQueryScanner:
         dataset_data = []
         
         try:
-            # List tables
             logger.info(f"    📋 Listing tables in {dataset_id}...")
             tables = list(client.list_tables(f"{project_id}.{dataset_id}", timeout=30))
             
@@ -204,28 +182,19 @@ class BigQueryScanner:
             
             logger.info(f"    ✅ Found {len(tables)} tables")
             
-            # Process each table
             for table_idx, table_ref in enumerate(tables, 1):
                 table_id = table_ref.table_id
                 
-                # Apply filter
                 if self.tables_filter and table_id not in self.tables_filter:
-                    logger.debug(f"    Skipping table {table_id} (not in filter)")
                     continue
                 
-                logger.info(f"\n      {'='*40}")
-                logger.info(f"      📋 TABLE {table_idx}/{len(tables)}: {table_id}")
-                logger.info(f"      {'='*40}")
+                logger.info(f"\n      📋 TABLE {table_idx}/{len(tables)}: {table_id}")
                 
                 try:
-                    table_data = await self.scan_table(client, project_id, dataset_id, table_id)
+                    # Try multiple approaches until one works
+                    table_data = await self.scan_table_with_fallback(client, project_id, dataset_id, table_id)
+                    
                     if table_data:
-                        # Check if table has potential hosts
-                        has_hosts = self._check_for_hosts(table_data)
-                        if has_hosts:
-                            logger.info(f"      🏠 Found potential hosts in {table_id}")
-                            self.tables_with_hosts.append(f"{project_id}.{dataset_id}.{table_id}")
-                        
                         dataset_data.append({
                             'type': 'bigquery',
                             'source': f'{project_id}.{dataset_id}.{table_id}',
@@ -238,215 +207,384 @@ class BigQueryScanner:
                         logger.info(f"      ✅ Successfully scanned {table_id}")
                         
                 except Exception as e:
-                    error_msg = str(e)
-                    logger.error(f"      ❌ Error scanning table {table_id}")
-                    logger.error(f"         Error: {error_msg}")
+                    logger.error(f"      ❌ All approaches failed for {table_id}: {e}")
                     self.tables_with_errors.append(f"{project_id}.{dataset_id}.{table_id}")
                     
-        except exceptions.Forbidden as e:
-            logger.error(f"    ❌ Permission denied listing tables in {dataset_id}")
-            
         except Exception as e:
             logger.error(f"    ❌ Error scanning dataset {dataset_id}: {e}")
         
         return dataset_data
     
-    async def scan_table(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
-        """Scan a BigQuery table and extract data - completely bypass pandas for problematic tables"""
+    async def scan_table_with_fallback(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
+        """Try multiple scanning approaches until one works"""
         full_table_id = f"{project_id}.{dataset_id}.{table_id}"
         
-        try:
-            # Get table metadata
-            table = client.get_table(full_table_id)
-            
-            if table.num_rows == 0:
-                logger.info(f"        ℹ️ Table {table_id} is empty")
-                return None
-            
-            logger.info(f"        📊 Table stats:")
-            logger.info(f"           Rows: {table.num_rows:,}")
-            logger.info(f"           Size: {table.num_bytes/1024/1024:.1f} MB")
-            logger.info(f"           Columns: {len(table.schema)}")
-            
-            # Log column names to help identify hostname columns
-            column_names = [field.name for field in table.schema]
-            logger.info(f"        📋 Columns: {', '.join(column_names[:10])}")
-            if len(column_names) > 10:
-                logger.info(f"           ... and {len(column_names)-10} more columns")
-            
-            # Check if table has REPEATED or ARRAY fields
-            has_arrays = any(field.mode == 'REPEATED' for field in table.schema)
-            has_structs = any(field.field_type == 'RECORD' for field in table.schema)
-            
-            if has_arrays or has_structs:
-                logger.info(f"        ⚠️ Table has complex fields (arrays/structs), using safe mode")
-            
-            # Determine how many rows to sample
-            sample_size = min(
-                int(table.num_rows * self.sample_percent / 100),
-                self.max_rows_per_table
-            )
-            
-            logger.info(f"        🎯 Sampling {sample_size:,} rows ({self.sample_percent}%)")
-            
-            # Build query
-            if sample_size < table.num_rows:
-                query = f"""
-                SELECT *
-                FROM `{full_table_id}`
-                TABLESAMPLE SYSTEM ({min(self.sample_percent, 100)} PERCENT)
-                LIMIT {sample_size}
-                """
-            else:
-                query = f"""
-                SELECT *
-                FROM `{full_table_id}`
-                LIMIT {sample_size}
-                """
-            
-            logger.info(f"        ⏳ Executing query...")
-            
-            # Execute query
-            query_job = client.query(query)
-            
-            # CRITICAL FIX: Use iterator approach for tables with arrays/complex types
-            if has_arrays or has_structs:
-                # Use row iterator to avoid pandas issues with arrays
-                rows = []
-                columns_data = defaultdict(list)
+        # List of approaches to try
+        approaches = [
+            ("Approach 1: Raw Iterator", self._scan_approach_1_raw_iterator),
+            ("Approach 2: JSON Conversion in SQL", self._scan_approach_2_json_sql),
+            ("Approach 3: Arrow Format", self._scan_approach_3_arrow),
+            ("Approach 4: Pandas with Aggressive Cleaning", self._scan_approach_4_pandas_clean),
+            ("Approach 5: Field by Field", self._scan_approach_5_field_by_field)
+        ]
+        
+        for approach_name, approach_func in approaches:
+            try:
+                logger.info(f"        🔄 Trying {approach_name}...")
+                result = await approach_func(client, project_id, dataset_id, table_id)
+                if result:
+                    logger.info(f"        ✅ {approach_name} succeeded!")
+                    self.successful_approaches[full_table_id] = approach_name
+                    return result
+            except Exception as e:
+                logger.debug(f"        ⚠️ {approach_name} failed: {str(e)[:100]}")
+                continue
+        
+        # If all approaches fail, return None
+        return None
+    
+    async def _scan_approach_1_raw_iterator(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
+        """Approach 1: Use raw BigQuery iterator, no pandas"""
+        full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+        
+        table = client.get_table(full_table_id)
+        if table.num_rows == 0:
+            return None
+        
+        sample_size = min(int(table.num_rows * self.sample_percent / 100), self.max_rows_per_table)
+        
+        query = f"SELECT * FROM `{full_table_id}` LIMIT {sample_size}"
+        query_job = client.query(query)
+        
+        rows = []
+        columns_data = defaultdict(list)
+        
+        for bq_row in query_job.result():
+            row_dict = {}
+            for field in table.schema:
+                field_name = field.name
+                value = bq_row.get(field_name)
                 
-                for row in query_job.result():
-                    row_dict = {}
-                    for field in table.schema:
-                        field_name = field.name
-                        value = row.get(field_name)
-                        
-                        # Clean value
-                        if value is None:
-                            cleaned_value = None
-                        elif isinstance(value, list):
-                            # For REPEATED fields, convert to JSON string to avoid issues
-                            cleaned_value = json.dumps(value)
-                        elif isinstance(value, dict):
-                            # For RECORD/STRUCT fields, convert to JSON string
-                            cleaned_value = json.dumps(value)
-                        elif isinstance(value, bytes):
-                            cleaned_value = value.decode('utf-8', errors='ignore')
-                        else:
-                            cleaned_value = value
-                        
-                        row_dict[field_name] = cleaned_value
-                        columns_data[field_name].append(cleaned_value)
-                    
-                    rows.append(row_dict)
+                # Convert everything to safe types
+                if value is None:
+                    clean_value = None
+                elif isinstance(value, (list, tuple)):
+                    clean_value = json.dumps(value)
+                elif isinstance(value, dict):
+                    clean_value = json.dumps(value)
+                elif isinstance(value, bytes):
+                    clean_value = value.decode('utf-8', errors='ignore')
+                else:
+                    clean_value = str(value) if value is not None else None
                 
-                # Build columns metadata
-                columns = {}
-                for field in table.schema:
-                    col_name = field.name
-                    col_values = columns_data.get(col_name, [])
-                    
-                    columns[col_name] = {
-                        'name': col_name,
-                        'type': field.field_type,
-                        'mode': field.mode,
-                        'samples': col_values[:100],
-                        'description': field.description
-                    }
-                    
-                    # Analyze column
-                    columns[col_name]['statistics'] = self._analyze_column(col_values)
-                    columns[col_name]['potential_type'] = self._infer_semantic_type(col_name, col_values)
-            else:
-                # For simple tables, use pandas but with aggressive cleaning
-                df = query_job.to_dataframe()
-                
-                # Aggressively handle NA values
-                for col in df.columns:
-                    try:
-                        # Replace any pandas NA with None
-                        df[col] = df[col].where(pd.notnull(df[col]), None)
-                    except:
-                        # If that fails, convert column to object type and try again
-                        df[col] = df[col].astype('object')
-                        df[col] = df[col].where(pd.notnull(df[col]), None)
-                
-                # Convert to records
-                rows = []
-                for _, row in df.iterrows():
-                    row_dict = {}
-                    for col in df.columns:
-                        value = row[col]
-                        # Final safety check
-                        if pd.isna(value):
-                            value = None
-                        elif isinstance(value, (np.ndarray, pd.Series)):
-                            value = value.tolist() if hasattr(value, 'tolist') else list(value)
-                        row_dict[col] = value
-                    rows.append(row_dict)
-                
-                # Build columns metadata
-                columns = {}
-                for field in table.schema:
-                    col_name = field.name
-                    
-                    if col_name in df.columns:
-                        # Get column values safely
-                        col_values = []
-                        for val in df[col_name]:
-                            if pd.isna(val):
-                                col_values.append(None)
-                            elif isinstance(val, (np.ndarray, pd.Series)):
-                                col_values.append(val.tolist() if hasattr(val, 'tolist') else list(val))
-                            else:
-                                col_values.append(val)
-                    else:
-                        col_values = []
-                    
-                    columns[col_name] = {
-                        'name': col_name,
-                        'type': field.field_type,
-                        'mode': field.mode,
-                        'samples': col_values[:100],
-                        'description': field.description
-                    }
-                    
-                    # Analyze column
-                    columns[col_name]['statistics'] = self._analyze_column(col_values)
-                    columns[col_name]['potential_type'] = self._infer_semantic_type(col_name, col_values)
+                row_dict[field_name] = clean_value
+                columns_data[field_name].append(clean_value)
             
-            if not rows:
-                logger.warning(f"        ⚠️ No rows returned from {table_id}")
-                return None
-            
-            logger.info(f"        ✅ Retrieved {len(rows)} rows")
-            
-            # Log interesting columns
-            for col_name, col_info in columns.items():
-                if col_info['potential_type'] in ['hostname', 'ip_address']:
-                    logger.info(f"        🎯 Found {col_info['potential_type']} column: {col_name}")
-            
-            self.rows_processed += len(rows)
-            
-            return {
-                'name': table_id,
-                'full_name': full_table_id,
-                'rows': rows,
-                'columns': columns,
-                'row_count': len(rows),
-                'total_rows': table.num_rows,
-                'created': str(table.created) if table.created else None,
-                'modified': str(table.modified) if table.modified else None,
-                'size_bytes': table.num_bytes,
-                'size_mb': round(table.num_bytes / 1024 / 1024, 2),
-                'description': table.description
+            rows.append(row_dict)
+        
+        columns = {}
+        for field in table.schema:
+            col_name = field.name
+            columns[col_name] = {
+                'name': col_name,
+                'type': field.field_type,
+                'mode': field.mode,
+                'samples': columns_data[col_name][:100],
+                'description': field.description,
+                'statistics': self._analyze_column(columns_data[col_name]),
+                'potential_type': self._infer_semantic_type(col_name, columns_data[col_name])
             }
+        
+        self.rows_processed += len(rows)
+        
+        return {
+            'name': table_id,
+            'full_name': full_table_id,
+            'rows': rows,
+            'columns': columns,
+            'row_count': len(rows),
+            'total_rows': table.num_rows
+        }
+    
+    async def _scan_approach_2_json_sql(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
+        """Approach 2: Convert complex types to JSON in SQL"""
+        full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+        
+        table = client.get_table(full_table_id)
+        if table.num_rows == 0:
+            return None
+        
+        sample_size = min(int(table.num_rows * self.sample_percent / 100), self.max_rows_per_table)
+        
+        # Build query that converts complex types to JSON
+        select_parts = []
+        for field in table.schema:
+            if field.mode == 'REPEATED' or field.field_type in ['RECORD', 'STRUCT']:
+                select_parts.append(f"TO_JSON_STRING({field.name}) AS {field.name}")
+            else:
+                select_parts.append(field.name)
+        
+        query = f"SELECT {', '.join(select_parts)} FROM `{full_table_id}` LIMIT {sample_size}"
+        query_job = client.query(query)
+        
+        # Now everything is strings or simple types
+        rows = []
+        columns_data = defaultdict(list)
+        
+        for bq_row in query_job.result():
+            row_dict = {}
+            for field in table.schema:
+                field_name = field.name
+                value = bq_row.get(field_name)
+                
+                if value is None:
+                    clean_value = None
+                elif isinstance(value, bytes):
+                    clean_value = value.decode('utf-8', errors='ignore')
+                else:
+                    clean_value = str(value) if value is not None else None
+                
+                row_dict[field_name] = clean_value
+                columns_data[field_name].append(clean_value)
             
-        except Exception as e:
-            logger.error(f"        ❌ Error scanning table {full_table_id}")
-            logger.error(f"           Error type: {type(e).__name__}")
-            logger.error(f"           Error: {e}")
-            raise
+            rows.append(row_dict)
+        
+        columns = {}
+        for field in table.schema:
+            col_name = field.name
+            columns[col_name] = {
+                'name': col_name,
+                'type': field.field_type,
+                'mode': field.mode,
+                'samples': columns_data[col_name][:100],
+                'description': field.description,
+                'statistics': self._analyze_column(columns_data[col_name]),
+                'potential_type': self._infer_semantic_type(col_name, columns_data[col_name])
+            }
+        
+        self.rows_processed += len(rows)
+        
+        return {
+            'name': table_id,
+            'full_name': full_table_id,
+            'rows': rows,
+            'columns': columns,
+            'row_count': len(rows),
+            'total_rows': table.num_rows
+        }
+    
+    async def _scan_approach_3_arrow(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
+        """Approach 3: Use Arrow format"""
+        full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+        
+        table = client.get_table(full_table_id)
+        if table.num_rows == 0:
+            return None
+        
+        sample_size = min(int(table.num_rows * self.sample_percent / 100), self.max_rows_per_table)
+        
+        query = f"SELECT * FROM `{full_table_id}` LIMIT {sample_size}"
+        query_job = client.query(query)
+        
+        # Use Arrow format
+        arrow_table = query_job.to_arrow()
+        
+        rows = []
+        columns = {}
+        
+        # Process Arrow table
+        for i in range(len(arrow_table)):
+            row_dict = {}
+            for col_name in arrow_table.column_names:
+                value = arrow_table[col_name][i]
+                
+                if hasattr(value, 'as_py'):
+                    py_value = value.as_py()
+                    if py_value is None:
+                        row_dict[col_name] = None
+                    elif isinstance(py_value, (list, dict)):
+                        row_dict[col_name] = json.dumps(py_value)
+                    else:
+                        row_dict[col_name] = py_value
+                else:
+                    row_dict[col_name] = str(value) if value is not None else None
+            
+            rows.append(row_dict)
+        
+        # Build columns
+        for field in table.schema:
+            col_name = field.name
+            if col_name in arrow_table.column_names:
+                col_data = []
+                for val in arrow_table[col_name].to_pylist()[:100]:
+                    if val is None:
+                        col_data.append(None)
+                    elif isinstance(val, (list, dict)):
+                        col_data.append(json.dumps(val))
+                    else:
+                        col_data.append(val)
+                
+                columns[col_name] = {
+                    'name': col_name,
+                    'type': field.field_type,
+                    'mode': field.mode,
+                    'samples': col_data,
+                    'description': field.description,
+                    'statistics': self._analyze_column(col_data),
+                    'potential_type': self._infer_semantic_type(col_name, col_data)
+                }
+        
+        self.rows_processed += len(rows)
+        
+        return {
+            'name': table_id,
+            'full_name': full_table_id,
+            'rows': rows,
+            'columns': columns,
+            'row_count': len(rows),
+            'total_rows': table.num_rows
+        }
+    
+    async def _scan_approach_4_pandas_clean(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
+        """Approach 4: Use pandas with aggressive NA cleaning"""
+        import pandas as pd
+        import numpy as np
+        
+        full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+        
+        table = client.get_table(full_table_id)
+        if table.num_rows == 0:
+            return None
+        
+        sample_size = min(int(table.num_rows * self.sample_percent / 100), self.max_rows_per_table)
+        
+        query = f"SELECT * FROM `{full_table_id}` LIMIT {sample_size}"
+        query_job = client.query(query)
+        
+        # Get DataFrame
+        df = query_job.to_dataframe()
+        
+        # Aggressively clean DataFrame
+        for col in df.columns:
+            # Convert column to object type first
+            df[col] = df[col].astype('object')
+            
+            # Replace all NA-like values
+            df[col] = df[col].where(pd.notnull(df[col]), None)
+            
+            # Convert arrays to strings
+            for idx in df.index:
+                val = df.at[idx, col]
+                if isinstance(val, (list, np.ndarray)):
+                    df.at[idx, col] = json.dumps(val.tolist() if hasattr(val, 'tolist') else list(val))
+                elif isinstance(val, dict):
+                    df.at[idx, col] = json.dumps(val)
+                elif pd.isna(val):
+                    df.at[idx, col] = None
+        
+        # Convert to records
+        rows = df.where(pd.notnull(df), None).to_dict('records')
+        
+        # Build columns
+        columns = {}
+        for field in table.schema:
+            col_name = field.name
+            if col_name in df.columns:
+                col_values = df[col_name].where(pd.notnull(df[col_name]), None).tolist()
+            else:
+                col_values = []
+            
+            columns[col_name] = {
+                'name': col_name,
+                'type': field.field_type,
+                'mode': field.mode,
+                'samples': col_values[:100],
+                'description': field.description,
+                'statistics': self._analyze_column(col_values),
+                'potential_type': self._infer_semantic_type(col_name, col_values)
+            }
+        
+        self.rows_processed += len(rows)
+        
+        return {
+            'name': table_id,
+            'full_name': full_table_id,
+            'rows': rows,
+            'columns': columns,
+            'row_count': len(rows),
+            'total_rows': table.num_rows
+        }
+    
+    async def _scan_approach_5_field_by_field(self, client: bigquery.Client, project_id: str, dataset_id: str, table_id: str) -> Optional[Dict]:
+        """Approach 5: Query each field separately to isolate problematic ones"""
+        full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+        
+        table = client.get_table(full_table_id)
+        if table.num_rows == 0:
+            return None
+        
+        sample_size = min(int(table.num_rows * self.sample_percent / 100), self.max_rows_per_table)
+        
+        # First get a row identifier or just row numbers
+        query = f"SELECT * FROM `{full_table_id}` LIMIT 1"
+        query_job = client.query(query)
+        test_row = list(query_job.result())
+        
+        if not test_row:
+            return None
+        
+        # Build complete result
+        rows = []
+        columns = {}
+        
+        # Get all data with safe field handling
+        safe_fields = []
+        for field in table.schema:
+            if field.mode == 'REPEATED' or field.field_type in ['RECORD', 'STRUCT', 'ARRAY']:
+                safe_fields.append(f"CAST(TO_JSON_STRING({field.name}) AS STRING) AS {field.name}")
+            else:
+                safe_fields.append(f"CAST({field.name} AS STRING) AS {field.name}")
+        
+        query = f"SELECT {', '.join(safe_fields)} FROM `{full_table_id}` LIMIT {sample_size}"
+        query_job = client.query(query)
+        
+        columns_data = defaultdict(list)
+        
+        for bq_row in query_job.result():
+            row_dict = {}
+            for field in table.schema:
+                field_name = field.name
+                value = bq_row.get(field_name)
+                
+                # Everything is already a string or None
+                row_dict[field_name] = value
+                columns_data[field_name].append(value)
+            
+            rows.append(row_dict)
+        
+        # Build columns metadata
+        for field in table.schema:
+            col_name = field.name
+            columns[col_name] = {
+                'name': col_name,
+                'type': field.field_type,
+                'mode': field.mode,
+                'samples': columns_data[col_name][:100],
+                'description': field.description,
+                'statistics': self._analyze_column(columns_data[col_name]),
+                'potential_type': self._infer_semantic_type(col_name, columns_data[col_name])
+            }
+        
+        self.rows_processed += len(rows)
+        
+        return {
+            'name': table_id,
+            'full_name': full_table_id,
+            'rows': rows,
+            'columns': columns,
+            'row_count': len(rows),
+            'total_rows': table.num_rows
+        }
     
     def _check_for_hosts(self, table_data: Dict) -> bool:
         """Check if table likely contains host information"""
@@ -463,24 +601,8 @@ class BigQueryScanner:
         if not samples:
             return {}
         
-        # Filter out None values and handle JSON strings
-        non_null = []
-        for s in samples:
-            if s is not None:
-                # If it's a JSON string (from array/struct), try to parse it
-                if isinstance(s, str) and s.startswith(('[', '{')):
-                    try:
-                        parsed = json.loads(s)
-                        if isinstance(parsed, list) and parsed:
-                            non_null.append(str(parsed[0]))
-                        elif isinstance(parsed, dict):
-                            non_null.append(str(parsed))
-                        else:
-                            non_null.append(s)
-                    except:
-                        non_null.append(s)
-                else:
-                    non_null.append(s)
+        # Filter out None values
+        non_null = [s for s in samples if s is not None]
         
         if not non_null:
             return {'all_null': True}
@@ -492,18 +614,35 @@ class BigQueryScanner:
             'unique_ratio': len(set(str(s) for s in non_null)) / len(non_null) if non_null else 0
         }
         
-        # Check for patterns
-        if non_null:
-            # Check for IP addresses
-            ip_pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
-            ip_matches = sum(1 for s in non_null if re.match(ip_pattern, str(s)))
-            stats['ip_likelihood'] = ip_matches / len(non_null) if non_null else 0
-            
-            # Check for hostnames/FQDNs
-            hostname_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$'
-            hostname_matches = sum(1 for s in non_null 
-                                 if re.match(hostname_pattern, str(s)) and '.' in str(s))
-            stats['hostname_likelihood'] = hostname_matches / len(non_null) if non_null else 0
+        # Check for patterns (handle JSON strings)
+        string_values = []
+        for s in non_null:
+            if isinstance(s, str):
+                # Try to extract from JSON if it's a JSON string
+                if s.startswith('[') or s.startswith('{'):
+                    try:
+                        parsed = json.loads(s)
+                        if isinstance(parsed, list) and parsed:
+                            string_values.append(str(parsed[0]))
+                        else:
+                            string_values.append(s)
+                    except:
+                        string_values.append(s)
+                else:
+                    string_values.append(s)
+            else:
+                string_values.append(str(s))
+        
+        # Check for IP addresses
+        ip_pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+        ip_matches = sum(1 for s in string_values if re.match(ip_pattern, s))
+        stats['ip_likelihood'] = ip_matches / len(string_values) if string_values else 0
+        
+        # Check for hostnames/FQDNs
+        hostname_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$'
+        hostname_matches = sum(1 for s in string_values 
+                             if re.match(hostname_pattern, s) and '.' in s)
+        stats['hostname_likelihood'] = hostname_matches / len(string_values) if string_values else 0
         
         return stats
     
@@ -521,33 +660,34 @@ class BigQueryScanner:
         elif any(pattern in col_lower for pattern in ['application', 'app', 'service']):
             return 'application'
         
-        # Check sample data patterns if column name doesn't match
+        # Check sample data patterns
         if samples:
             non_null = []
             for s in samples[:100]:
                 if s is not None:
-                    # Handle JSON strings from arrays/structs
-                    if isinstance(s, str) and s.startswith(('[', '{')):
+                    if isinstance(s, str) and (s.startswith('[') or s.startswith('{')):
                         try:
                             parsed = json.loads(s)
                             if isinstance(parsed, list) and parsed:
                                 non_null.append(str(parsed[0]))
+                            else:
+                                non_null.append(s)
                         except:
                             non_null.append(s)
                     else:
-                        non_null.append(s)
+                        non_null.append(str(s) if s is not None else '')
             
             if non_null:
                 # Check for IP pattern
                 ip_matches = sum(1 for s in non_null 
-                               if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', str(s)))
+                               if re.match(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$', s))
                 if ip_matches > len(non_null) * 0.8:
                     return 'ip_address'
                 
                 # Check for hostname/FQDN pattern
                 hostname_matches = sum(1 for s in non_null 
-                                     if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', str(s))
-                                     and '.' in str(s))
+                                     if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', s)
+                                     and '.' in s)
                 if hostname_matches > len(non_null) * 0.6:
                     return 'hostname'
         
@@ -562,5 +702,6 @@ class BigQueryScanner:
             'tables_scanned': self.tables_scanned,
             'rows_processed': self.rows_processed,
             'tables_with_hosts': self.tables_with_hosts,
-            'tables_with_errors': self.tables_with_errors
+            'tables_with_errors': self.tables_with_errors,
+            'successful_approaches': self.successful_approaches
         }

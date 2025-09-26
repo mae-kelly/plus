@@ -1,204 +1,515 @@
-# debug_bigquery.py
-"""
-Debug script to find where the NA/array error is ACTUALLY coming from
-"""
-
-import sys
-import os
-import logging
-import traceback
-
-# Setup detailed logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Add parent directory to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-def test_direct_bigquery():
-    """Test BigQuery directly without any scanner"""
-    from google.cloud import bigquery
+async def _scan_table_with_ml(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Scan table with ML-enhanced column detection using multiple strategies"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
     
-    client = bigquery.Client(project='prj-tiay-p-gcss-sas-dl9dd01ddf')
+    # Define multiple scanning strategies
+    strategies = [
+        ('iterator_simple', self._scan_strategy_iterator_simple),
+        ('iterator_with_conversion', self._scan_strategy_iterator_with_conversion),
+        ('to_arrow', self._scan_strategy_arrow),
+        ('to_dataframe_safe', self._scan_strategy_dataframe_safe),
+        ('direct_sql', self._scan_strategy_direct_sql),
+        ('fallback_minimal', self._scan_strategy_fallback_minimal)
+    ]
     
-    # Test a problematic table directly
-    query = """
-    SELECT * 
-    FROM `prj-tiay-p-gcss-sas-dl9dd01ddf.CSIRT.ctl_tip_backup`
-    LIMIT 5
+    # Try each strategy until one works
+    for strategy_name, strategy_func in strategies:
+        try:
+            logger.debug(f"Attempting strategy: {strategy_name} for table {table_id}")
+            result = await strategy_func(client, project_id, dataset_id, table_id)
+            
+            if result is not None:
+                logger.info(f"✅ Successfully scanned {table_id} using strategy: {strategy_name}")
+                return result
+                
+        except Exception as e:
+            logger.debug(f"Strategy {strategy_name} failed for {table_id}: {str(e)[:100]}")
+            continue
+    
+    # If all strategies fail, return minimal data
+    logger.warning(f"All strategies failed for {full_table_id}, returning minimal data")
+    return await self._get_minimal_table_info(client, project_id, dataset_id, table_id)
+
+async def _scan_strategy_iterator_simple(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Strategy 1: Simple iterator without pandas"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+    
+    table = client.get_table(full_table_id)
+    if table.num_rows == 0:
+        return None
+    
+    sample_size = min(
+        int(table.num_rows * self.config['bigquery']['sample_percent'] / 100),
+        self.config['bigquery'].get('max_rows_per_table', 100000)
+    )
+    
+    query = f"""
+    SELECT *
+    FROM `{full_table_id}`
+    TABLESAMPLE SYSTEM ({min(self.config['bigquery']['sample_percent'], 100)} PERCENT)
+    LIMIT {sample_size}
     """
     
-    print("\n" + "="*80)
-    print("TEST 1: Direct BigQuery Query (No DataFrame)")
-    print("="*80)
+    query_job = client.query(query)
+    rows = []
+    columns_with_features = {}
     
-    try:
-        query_job = client.query(query)
-        
-        # Method 1: Iterator only
-        print("\nMethod 1: Using iterator only...")
-        for row in query_job.result():
-            print(f"Row type: {type(row)}")
-            for key in row.keys():
-                value = row[key]
-                print(f"  {key}: type={type(value)}, value={str(value)[:50]}")
-            break  # Just first row
-        print("✅ Iterator method worked!")
-        
-    except Exception as e:
-        print(f"❌ Iterator failed: {e}")
-        traceback.print_exc()
+    # Initialize columns from schema
+    for field in table.schema:
+        columns_with_features[field.name] = {
+            'name': field.name,
+            'samples': [],
+            'features': None,
+            'statistics': {},
+            'type': field.field_type,
+            'mode': field.mode
+        }
     
-    print("\n" + "-"*80)
-    
-    # Method 2: Try to_dataframe
-    print("\nMethod 2: Using to_dataframe()...")
-    try:
-        query_job = client.query(query)
-        df = query_job.to_dataframe()
-        print(f"✅ to_dataframe worked! Shape: {df.shape}")
-    except Exception as e:
-        print(f"❌ to_dataframe failed: {e}")
-        traceback.print_exc()
-    
-    print("\n" + "-"*80)
-    
-    # Method 3: Try to_arrow
-    print("\nMethod 3: Using to_arrow()...")
-    try:
-        query_job = client.query(query)
-        arrow_table = query_job.to_arrow()
-        print(f"✅ to_arrow worked! Rows: {len(arrow_table)}")
-    except Exception as e:
-        print(f"❌ to_arrow failed: {e}")
-        traceback.print_exc()
-
-def test_imports():
-    """Test if the issue is in imports"""
-    print("\n" + "="*80)
-    print("TEST 2: Testing Imports")
-    print("="*80)
-    
-    # Test pandas import
-    try:
-        import pandas as pd
-        print(f"✅ Pandas version: {pd.__version__}")
-        
-        # Test NA handling
-        try:
-            val = pd.NA
-            if val:  # This should trigger the error if it's a pandas issue
-                pass
-        except Exception as e:
-            print(f"❌ Pandas NA issue: {e}")
+    # Process rows without pandas
+    for row in query_job.result():
+        row_dict = {}
+        for field in table.schema:
+            value = row.get(field.name)
             
-    except ImportError as e:
-        print(f"❌ Can't import pandas: {e}")
-    
-    # Test numpy import
-    try:
-        import numpy as np
-        print(f"✅ NumPy version: {np.__version__}")
-    except ImportError as e:
-        print(f"❌ Can't import numpy: {e}")
-    
-    # Test google-cloud-bigquery version
-    try:
-        import google.cloud.bigquery
-        print(f"✅ BigQuery client version: {google.cloud.bigquery.__version__}")
-    except ImportError as e:
-        print(f"❌ Can't import BigQuery: {e}")
-
-def test_scanner_minimal():
-    """Test the scanner with minimal code"""
-    print("\n" + "="*80)
-    print("TEST 3: Minimal Scanner Test")
-    print("="*80)
-    
-    try:
-        from core.bigquery_client_manager import BigQueryClientManager
-        
-        manager = BigQueryClientManager(project_id='prj-tiay-p-gcss-sas-dl9dd01ddf')
-        client = manager.get_client()
-        
-        # Get table directly
-        table = client.get_table('prj-tiay-p-gcss-sas-dl9dd01ddf.CSIRT.ctl_tip_backup')
-        print(f"✅ Got table: {table.table_id}, rows: {table.num_rows}")
-        
-        # Try simple query
-        query = "SELECT * FROM `prj-tiay-p-gcss-sas-dl9dd01ddf.CSIRT.ctl_tip_backup` LIMIT 1"
-        query_job = client.query(query)
-        
-        for row in query_job.result():
-            print(f"✅ Got row with {len(row)} fields")
-            break
+            # Handle special types
+            if value is not None:
+                if field.field_type in ['RECORD', 'STRUCT', 'JSON']:
+                    value = str(value)
+                elif field.mode == 'REPEATED':
+                    value = str(value) if value else '[]'
+                elif hasattr(value, 'isoformat'):
+                    value = value.isoformat()
             
-    except Exception as e:
-        print(f"❌ Scanner test failed: {e}")
-        traceback.print_exc()
-
-def find_the_real_issue():
-    """Try to find where the error is REALLY coming from"""
-    print("\n" + "="*80)
-    print("TEST 4: Finding the REAL issue")
-    print("="*80)
-    
-    # Check if it's in streaming_handler.py
-    try:
-        from streaming_handler import StreamingHandler
-        print("⚠️ StreamingHandler imported - checking if it uses pandas...")
-        
-        # Check the source
-        import inspect
-        source = inspect.getsource(StreamingHandler)
-        if 'pandas' in source or 'pd.' in source:
-            print("❌ StreamingHandler uses pandas!")
-        if 'to_dataframe' in source:
-            print("❌ StreamingHandler calls to_dataframe()!")
+            row_dict[field.name] = value
             
-    except Exception as e:
-        print(f"Couldn't check StreamingHandler: {e}")
+            # Collect samples
+            if len(columns_with_features[field.name]['samples']) < 100:
+                columns_with_features[field.name]['samples'].append(value)
+        
+        rows.append(row_dict)
     
-    # Check if it's in main.py
+    # Extract features for each column
+    for col_name, col_data in columns_with_features.items():
+        values = col_data['samples']
+        
+        # Extract features using feature extractor
+        features = await self.feature_extractor.extract(col_name, values)
+        col_data['features'] = features
+        col_data['statistics'] = self._analyze_column(col_name, values)
+    
+    self.stats['rows_processed'] += len(rows)
+    
+    return {
+        'name': table_id,
+        'full_name': full_table_id,
+        'rows': rows,
+        'columns': columns_with_features,
+        'row_count': len(rows),
+        'total_rows': table.num_rows
+    }
+
+async def _scan_strategy_iterator_with_conversion(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Strategy 2: Iterator with TO_JSON_STRING for complex types"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+    
+    table = client.get_table(full_table_id)
+    if table.num_rows == 0:
+        return None
+    
+    # Build query with JSON conversion for complex types
+    select_parts = []
+    complex_fields = []
+    
+    for field in table.schema:
+        if field.mode == 'REPEATED' or field.field_type in ['RECORD', 'STRUCT', 'JSON', 'GEOGRAPHY', 'ARRAY']:
+            select_parts.append(f"TO_JSON_STRING({field.name}) AS {field.name}")
+            complex_fields.append(field.name)
+        else:
+            select_parts.append(field.name)
+    
+    sample_size = min(
+        int(table.num_rows * self.config['bigquery']['sample_percent'] / 100),
+        self.config['bigquery'].get('max_rows_per_table', 100000)
+    )
+    
+    query = f"""
+    SELECT {', '.join(select_parts)}
+    FROM `{full_table_id}`
+    TABLESAMPLE SYSTEM ({min(self.config['bigquery']['sample_percent'], 100)} PERCENT)
+    LIMIT {sample_size}
+    """
+    
+    query_job = client.query(query)
+    rows = []
+    columns_with_features = {}
+    
+    # Process results
+    for row in query_job.result():
+        row_dict = dict(row)
+        rows.append(row_dict)
+        
+        for key, value in row_dict.items():
+            if key not in columns_with_features:
+                columns_with_features[key] = {
+                    'name': key,
+                    'samples': [],
+                    'features': None,
+                    'statistics': {}
+                }
+            
+            if len(columns_with_features[key]['samples']) < 100:
+                columns_with_features[key]['samples'].append(value)
+    
+    # Extract features
+    for col_name, col_data in columns_with_features.items():
+        values = col_data['samples']
+        features = await self.feature_extractor.extract(col_name, values)
+        col_data['features'] = features
+        col_data['statistics'] = self._analyze_column(col_name, values)
+    
+    self.stats['rows_processed'] += len(rows)
+    
+    return {
+        'name': table_id,
+        'full_name': full_table_id,
+        'rows': rows,
+        'columns': columns_with_features,
+        'row_count': len(rows),
+        'total_rows': table.num_rows
+    }
+
+async def _scan_strategy_arrow(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Strategy 3: Use PyArrow for better type handling"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+    
+    table = client.get_table(full_table_id)
+    if table.num_rows == 0:
+        return None
+    
+    sample_size = min(
+        int(table.num_rows * self.config['bigquery']['sample_percent'] / 100),
+        self.config['bigquery'].get('max_rows_per_table', 100000)
+    )
+    
+    query = f"""
+    SELECT *
+    FROM `{full_table_id}`
+    TABLESAMPLE SYSTEM ({min(self.config['bigquery']['sample_percent'], 100)} PERCENT)
+    LIMIT {sample_size}
+    """
+    
+    query_job = client.query(query)
+    
+    # Try to use Arrow
+    arrow_table = query_job.to_arrow()
+    
+    rows = []
+    columns_with_features = {}
+    
+    # Convert Arrow table to Python objects
+    for col_name in arrow_table.column_names:
+        column = arrow_table.column(col_name)
+        
+        columns_with_features[col_name] = {
+            'name': col_name,
+            'samples': [],
+            'features': None,
+            'statistics': {}
+        }
+        
+        # Convert to Python list safely
+        for i in range(min(len(column), sample_size)):
+            value = column[i].as_py() if hasattr(column[i], 'as_py') else str(column[i])
+            
+            if i < 100:
+                columns_with_features[col_name]['samples'].append(value)
+            
+            if i < len(rows):
+                rows[i][col_name] = value
+            else:
+                rows.append({col_name: value})
+    
+    # Extract features
+    for col_name, col_data in columns_with_features.items():
+        values = col_data['samples']
+        features = await self.feature_extractor.extract(col_name, values)
+        col_data['features'] = features
+        col_data['statistics'] = self._analyze_column(col_name, values)
+    
+    self.stats['rows_processed'] += len(rows)
+    
+    return {
+        'name': table_id,
+        'full_name': full_table_id,
+        'rows': rows,
+        'columns': columns_with_features,
+        'row_count': len(rows),
+        'total_rows': table.num_rows
+    }
+
+async def _scan_strategy_dataframe_safe(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Strategy 4: Use DataFrame with safe conversion"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+    
+    table = client.get_table(full_table_id)
+    if table.num_rows == 0:
+        return None
+    
+    sample_size = min(
+        int(table.num_rows * self.config['bigquery']['sample_percent'] / 100),
+        self.config['bigquery'].get('max_rows_per_table', 100000)
+    )
+    
+    query = f"""
+    SELECT *
+    FROM `{full_table_id}`
+    TABLESAMPLE SYSTEM ({min(self.config['bigquery']['sample_percent'], 100)} PERCENT)
+    LIMIT {sample_size}
+    """
+    
+    query_job = client.query(query)
+    
+    # Use to_dataframe with specific dtypes to avoid issues
+    import pandas as pd
+    
+    # Set string dtype for problematic columns
+    dtype_kwargs = {}
+    for field in table.schema:
+        if field.field_type in ['RECORD', 'STRUCT', 'JSON', 'ARRAY'] or field.mode == 'REPEATED':
+            dtype_kwargs[field.name] = 'object'
+    
+    if dtype_kwargs:
+        df = query_job.to_dataframe(create_bqstorage_client=False, dtypes=dtype_kwargs)
+    else:
+        df = query_job.to_dataframe(create_bqstorage_client=False)
+    
+    # Convert DataFrame to safe format
+    rows = []
+    columns_with_features = {}
+    
+    for col_name in df.columns:
+        columns_with_features[col_name] = {
+            'name': col_name,
+            'samples': [],
+            'features': None,
+            'statistics': {}
+        }
+        
+        # Get samples safely
+        col_values = df[col_name]
+        for i in range(min(100, len(col_values))):
+            value = col_values.iloc[i]
+            
+            # Handle pandas NA and numpy arrays
+            if pd.isna(value):
+                value = None
+            elif hasattr(value, 'tolist'):
+                value = value.tolist()
+            elif hasattr(value, 'item'):
+                value = value.item()
+            else:
+                value = str(value) if value is not None else None
+            
+            columns_with_features[col_name]['samples'].append(value)
+    
+    # Convert rows
+    for _, row in df.iterrows():
+        row_dict = {}
+        for col in df.columns:
+            value = row[col]
+            
+            # Safe conversion
+            if pd.isna(value):
+                value = None
+            elif hasattr(value, 'tolist'):
+                value = value.tolist()
+            elif hasattr(value, 'item'):
+                value = value.item()
+            else:
+                value = str(value) if value is not None else None
+            
+            row_dict[col] = value
+        
+        rows.append(row_dict)
+    
+    # Extract features
+    for col_name, col_data in columns_with_features.items():
+        values = col_data['samples']
+        features = await self.feature_extractor.extract(col_name, values)
+        col_data['features'] = features
+        col_data['statistics'] = self._analyze_column(col_name, values)
+    
+    self.stats['rows_processed'] += len(rows)
+    
+    return {
+        'name': table_id,
+        'full_name': full_table_id,
+        'rows': rows,
+        'columns': columns_with_features,
+        'row_count': len(rows),
+        'total_rows': table.num_rows
+    }
+
+async def _scan_strategy_direct_sql(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Strategy 5: Direct SQL with explicit casting"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+    
+    table = client.get_table(full_table_id)
+    if table.num_rows == 0:
+        return None
+    
+    # Get column info first
+    info_query = f"""
+    SELECT 
+        column_name,
+        data_type
+    FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = '{table_id}'
+    """
+    
     try:
-        with open('main.py', 'r') as f:
-            main_content = f.read()
-            if 'to_dataframe' in main_content:
-                print("❌ main.py uses to_dataframe()!")
-            if '.where(' in main_content or 'pd.notnull' in main_content:
-                print("❌ main.py has pandas operations that might cause NA issues!")
+        info_job = client.query(info_query)
+        column_info = {row['column_name']: row['data_type'] for row in info_job.result()}
     except:
-        pass
+        # Fallback to schema
+        column_info = {field.name: field.field_type for field in table.schema}
     
-    # Check config.json processing
+    # Build safe query with casting
+    select_parts = []
+    for col_name, col_type in column_info.items():
+        if col_type in ['ARRAY', 'STRUCT', 'JSON', 'GEOGRAPHY']:
+            select_parts.append(f"CAST({col_name} AS STRING) AS {col_name}")
+        else:
+            select_parts.append(col_name)
+    
+    if not select_parts:
+        select_parts = ['*']
+    
+    sample_size = min(1000, table.num_rows)  # Smaller sample for safety
+    
+    query = f"""
+    SELECT {', '.join(select_parts)}
+    FROM `{full_table_id}`
+    LIMIT {sample_size}
+    """
+    
+    query_job = client.query(query)
+    
+    rows = []
+    columns_with_features = {}
+    
+    for row in query_job.result():
+        row_dict = dict(row)
+        rows.append(row_dict)
+        
+        for key, value in row_dict.items():
+            if key not in columns_with_features:
+                columns_with_features[key] = {
+                    'name': key,
+                    'samples': [],
+                    'features': None,
+                    'statistics': {}
+                }
+            
+            if len(columns_with_features[key]['samples']) < 100:
+                columns_with_features[key]['samples'].append(value)
+    
+    # Extract features
+    for col_name, col_data in columns_with_features.items():
+        values = col_data['samples']
+        features = await self.feature_extractor.extract(col_name, values)
+        col_data['features'] = features
+        col_data['statistics'] = self._analyze_column(col_name, values)
+    
+    self.stats['rows_processed'] += len(rows)
+    
+    return {
+        'name': table_id,
+        'full_name': full_table_id,
+        'rows': rows,
+        'columns': columns_with_features,
+        'row_count': len(rows),
+        'total_rows': table.num_rows
+    }
+
+async def _scan_strategy_fallback_minimal(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Strategy 6: Minimal scan - just get schema and a few rows"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+    
+    table = client.get_table(full_table_id)
+    
+    columns_with_features = {}
+    rows = []
+    
+    # Just get schema info
+    for field in table.schema:
+        columns_with_features[field.name] = {
+            'name': field.name,
+            'type': field.field_type,
+            'mode': field.mode,
+            'samples': [],
+            'features': None,
+            'statistics': {}
+        }
+    
+    # Try to get just a few rows
     try:
-        import json
-        with open('config.json', 'r') as f:
-            config = json.load(f)
-            print(f"✅ Config loaded successfully")
-    except Exception as e:
-        print(f"❌ Config issue: {e}")
-
-def main():
-    print("""
-    ╔══════════════════════════════════════════════════════════╗
-    ║           BigQuery NA/Array Error Debugger              ║
-    ╚══════════════════════════════════════════════════════════╝
-    """)
+        query = f"SELECT * FROM `{full_table_id}` LIMIT 10"
+        query_job = client.query(query)
+        
+        for row in query_job.result():
+            row_dict = {}
+            for field in table.schema:
+                try:
+                    value = row.get(field.name)
+                    row_dict[field.name] = str(value) if value is not None else None
+                    
+                    if len(columns_with_features[field.name]['samples']) < 10:
+                        columns_with_features[field.name]['samples'].append(str(value) if value is not None else None)
+                except:
+                    row_dict[field.name] = None
+            
+            rows.append(row_dict)
+    except:
+        logger.warning(f"Could not sample rows from {table_id}")
     
-    # Run all tests
-    test_imports()
-    test_direct_bigquery()
-    test_scanner_minimal()
-    find_the_real_issue()
+    self.stats['rows_processed'] += len(rows)
     
-    print("\n" + "="*80)
-    print("DEBUGGING COMPLETE")
-    print("="*80)
-    print("\nBased on the results above, we can identify where the issue is coming from.")
+    return {
+        'name': table_id,
+        'full_name': full_table_id,
+        'rows': rows,
+        'columns': columns_with_features,
+        'row_count': len(rows),
+        'total_rows': table.num_rows,
+        'scan_type': 'minimal'
+    }
 
-if __name__ == "__main__":
-    main()
+async def _get_minimal_table_info(self, client, project_id: str, dataset_id: str, table_id: str) -> Dict:
+    """Get absolute minimal info when all strategies fail"""
+    full_table_id = f"{project_id}.{dataset_id}.{table_id}"
+    
+    try:
+        table = client.get_table(full_table_id)
+        
+        return {
+            'name': table_id,
+            'full_name': full_table_id,
+            'rows': [],
+            'columns': {field.name: {'name': field.name, 'type': field.field_type} for field in table.schema},
+            'row_count': 0,
+            'total_rows': table.num_rows,
+            'scan_type': 'metadata_only',
+            'error': 'All scan strategies failed'
+        }
+    except:
+        return {
+            'name': table_id,
+            'full_name': full_table_id,
+            'rows': [],
+            'columns': {},
+            'row_count': 0,
+            'total_rows': 0,
+            'scan_type': 'failed',
+            'error': 'Could not access table'
+        }

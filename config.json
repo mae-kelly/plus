@@ -1,17 +1,39 @@
 {
   "projects": ["your-project-id-1", "your-project-id-2"],
-  "max_workers": 5,
-  "max_memory_mb": 8192,
-  "rows_per_batch": 10000,
-  "checkpoint_enabled": true,
-  "retry_attempts": 3,
-  "retry_delay_seconds": 5,
-  "sampling_percent_for_large_tables": 10,
-  "large_table_threshold_rows": 1000000,
-  "log_level": "INFO",
-  "export_formats": ["duckdb", "csv"],
-  "column_limit": 100,
-  "max_raw_forms_per_host": 20,
-  "max_occurrences_per_host": 100,
-  "max_values_per_column": 50
+  "max_workers": 8,
+  "batch_size": 128,
+  "device": "mps",
+  "model_config": {
+    "sherlock_features": 1588,
+    "sato_topics": 400,
+    "doduo_tokens": 8,
+    "ensemble_threshold": 0.85,
+    "llm_model": "gpt-4",
+    "llm_batch_size": 50,
+    "weak_supervision_ratio": 0.013
+  },
+  "entity_resolution": {
+    "blocking_strategy": "neural_lsh",
+    "comparison_threshold": 0.01,
+    "graph_clustering": true,
+    "confidence_levels": [0.9, 0.7, 0.5]
+  },
+  "storage": {
+    "streaming_enabled": true,
+    "kafka_brokers": ["localhost:9092"],
+    "elasticsearch_host": "localhost:9200",
+    "neo4j_uri": "bolt://localhost:7687",
+    "duckdb_path": "cmdb.db"
+  },
+  "optimization": {
+    "mixed_precision": true,
+    "gradient_checkpointing": true,
+    "memory_fraction": 0.9,
+    "cache_size_gb": 8
+  },
+  "sampling": {
+    "max_rows_per_table": 100000,
+    "column_sample_size": 1000,
+    "confidence_threshold": 0.7
+  }
 }

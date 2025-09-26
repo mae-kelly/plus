@@ -1,3 +1,8 @@
+# storage/streaming_handler.py
+"""
+Streaming Handler - Handles Kafka streaming with proper error handling
+"""
+
 import json
 from typing import Dict, Any, List
 from datetime import datetime
@@ -9,16 +14,22 @@ logger = logging.getLogger(__name__)
 class StreamingHandler:
     def __init__(self, config: Dict):
         self.config = config
-        self.brokers = config['storage'].get('kafka_brokers', [])
+        
+        # Safely get storage config
+        storage_config = config.get('storage', {})
+        self.brokers = storage_config.get('kafka_brokers', [])
         
         self.producer = None
         self.consumers = {}
         
-        # Only initialize if brokers are configured
-        if self.brokers and len(self.brokers) > 0 and self.brokers[0]:
+        # Only initialize if brokers are properly configured
+        if self.brokers and len(self.brokers) > 0 and self.brokers[0] and self.brokers[0] != "":
             self._init_producer()
+        else:
+            logger.info("Kafka streaming disabled - no brokers configured")
     
     def _init_producer(self):
+        """Initialize Kafka producer if available"""
         try:
             from kafka import KafkaProducer
             
@@ -31,12 +42,16 @@ class StreamingHandler:
                 linger_ms=10,
                 max_block_ms=1000  # Don't wait forever if Kafka is down
             )
-            logger.info("Kafka producer initialized")
+            logger.info(f"Kafka producer initialized with brokers: {self.brokers}")
+        except ImportError:
+            logger.info("kafka-python not installed. Install with: pip install kafka-python")
+            self.producer = None
         except Exception as e:
             logger.warning(f"Kafka not available: {e}. Continuing without streaming.")
             self.producer = None
     
     async def publish(self, topic: str, message: Dict, key: str = None):
+        """Publish message to Kafka topic"""
         if not self.producer:
             return
         
@@ -57,6 +72,7 @@ class StreamingHandler:
             logger.debug(f"Could not publish message: {e}")
     
     async def publish_batch(self, topic: str, messages: List[Dict]):
+        """Publish batch of messages"""
         if not self.producer:
             return
         
@@ -79,7 +95,8 @@ class StreamingHandler:
             pass
     
     def subscribe(self, topic: str, group_id: str = 'cmdb_consumer'):
-        if not self.brokers or len(self.brokers) == 0:
+        """Subscribe to Kafka topic"""
+        if not self.brokers or len(self.brokers) == 0 or not self.brokers[0]:
             return None
             
         if topic in self.consumers:
@@ -103,11 +120,15 @@ class StreamingHandler:
             
             return consumer
             
+        except ImportError:
+            logger.debug("kafka-python not installed")
+            return None
         except Exception as e:
             logger.debug(f"Could not subscribe to {topic}: {e}")
             return None
     
     async def consume_messages(self, topic: str, handler_func, max_messages: int = None):
+        """Consume messages from Kafka topic"""
         consumer = self.subscribe(topic)
         
         if not consumer:
@@ -130,6 +151,7 @@ class StreamingHandler:
             consumer.close()
     
     async def stream_discoveries(self, discovered_hosts: Dict):
+        """Stream discovered hosts"""
         if not self.producer:
             return
             
@@ -147,6 +169,7 @@ class StreamingHandler:
             await self.publish(topic, message, key=hostname)
     
     async def stream_classifications(self, classifications: Dict):
+        """Stream column classifications"""
         if not self.producer:
             return
             
@@ -164,6 +187,7 @@ class StreamingHandler:
             await self.publish(topic, message, key=column_name)
     
     async def stream_relationships(self, relationships: List[Dict]):
+        """Stream discovered relationships"""
         if not self.producer:
             return
             
@@ -181,6 +205,7 @@ class StreamingHandler:
             await self.publish(topic, message)
     
     def get_metrics(self) -> Dict:
+        """Get Kafka metrics"""
         metrics = {}
         
         if self.producer:
@@ -198,6 +223,7 @@ class StreamingHandler:
         return metrics
     
     def close(self):
+        """Close all Kafka connections"""
         if self.producer:
             try:
                 self.producer.close()

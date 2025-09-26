@@ -1,39 +1,107 @@
 {
-  "projects": ["test-project"],
-  "max_workers": 4,
-  "batch_size": 64,
-  "device": "mps",
-  "model_config": {
-    "sherlock_features": 1588,
-    "sato_topics": 400,
-    "doduo_tokens": 8,
-    "ensemble_threshold": 0.85,
-    "llm_model": "rule-based",
-    "llm_batch_size": 50,
-    "weak_supervision_ratio": 0.013
+  "bigquery": {
+    "projects": [
+      "REPLACE-WITH-YOUR-PROJECT-ID-1",
+      "REPLACE-WITH-YOUR-PROJECT-ID-2"
+    ],
+    "credentials_path": "gcp_credentials.json",
+    "datasets_filter": [],
+    "tables_filter": [],
+    "sample_percent": 10,
+    "max_rows_per_table": 100000,
+    "timeout_seconds": 60
   },
-  "entity_resolution": {
-    "blocking_strategy": "neural_lsh",
-    "comparison_threshold": 0.01,
-    "graph_clustering": false,
-    "confidence_levels": [0.9, 0.7, 0.5]
+  "discovery": {
+    "hostname_patterns": [
+      {"column_pattern": ".*hostname.*", "confidence": 0.95},
+      {"column_pattern": ".*host_name.*", "confidence": 0.95},
+      {"column_pattern": ".*server.*name.*", "confidence": 0.9},
+      {"column_pattern": ".*instance.*name.*", "confidence": 0.9},
+      {"column_pattern": ".*machine.*name.*", "confidence": 0.85},
+      {"column_pattern": ".*device.*name.*", "confidence": 0.85},
+      {"column_pattern": ".*node.*name.*", "confidence": 0.85},
+      {"column_pattern": ".*computer.*name.*", "confidence": 0.85},
+      {"column_pattern": ".*fqdn.*", "confidence": 0.95},
+      {"column_pattern": ".*host.*", "confidence": 0.7},
+      {"column_pattern": ".*server.*", "confidence": 0.6},
+      {"column_pattern": ".*instance.*", "confidence": 0.6},
+      {"column_pattern": ".*node.*", "confidence": 0.6}
+    ],
+    "ip_patterns": [
+      {"column_pattern": ".*ip.*address.*", "confidence": 0.95},
+      {"column_pattern": ".*ip_addr.*", "confidence": 0.95},
+      {"column_pattern": ".*ipv4.*", "confidence": 0.95},
+      {"column_pattern": ".*ipv6.*", "confidence": 0.95},
+      {"column_pattern": ".*private.*ip.*", "confidence": 0.9},
+      {"column_pattern": ".*public.*ip.*", "confidence": 0.9},
+      {"column_pattern": ".*internal.*ip.*", "confidence": 0.9},
+      {"column_pattern": ".*external.*ip.*", "confidence": 0.9},
+      {"column_pattern": ".*ip.*", "confidence": 0.7},
+      {"column_pattern": ".*address.*", "confidence": 0.5}
+    ],
+    "environment_patterns": [
+      {"column_pattern": ".*environment.*", "confidence": 0.95},
+      {"column_pattern": ".*env.*", "confidence": 0.9},
+      {"column_pattern": ".*stage.*", "confidence": 0.8},
+      {"column_pattern": ".*tier.*", "confidence": 0.7}
+    ],
+    "application_patterns": [
+      {"column_pattern": ".*application.*", "confidence": 0.95},
+      {"column_pattern": ".*app.*name.*", "confidence": 0.9},
+      {"column_pattern": ".*service.*name.*", "confidence": 0.9},
+      {"column_pattern": ".*app.*", "confidence": 0.7},
+      {"column_pattern": ".*service.*", "confidence": 0.7},
+      {"column_pattern": ".*component.*", "confidence": 0.6}
+    ],
+    "owner_patterns": [
+      {"column_pattern": ".*owner.*", "confidence": 0.95},
+      {"column_pattern": ".*team.*", "confidence": 0.9},
+      {"column_pattern": ".*department.*", "confidence": 0.8},
+      {"column_pattern": ".*contact.*", "confidence": 0.7},
+      {"column_pattern": ".*managed.*by.*", "confidence": 0.8}
+    ],
+    "location_patterns": [
+      {"column_pattern": ".*region.*", "confidence": 0.95},
+      {"column_pattern": ".*zone.*", "confidence": 0.9},
+      {"column_pattern": ".*datacenter.*", "confidence": 0.95},
+      {"column_pattern": ".*dc.*", "confidence": 0.7},
+      {"column_pattern": ".*location.*", "confidence": 0.8},
+      {"column_pattern": ".*site.*", "confidence": 0.7}
+    ],
+    "cluster_patterns": [
+      {"column_pattern": ".*cluster.*", "confidence": 0.95},
+      {"column_pattern": ".*pool.*", "confidence": 0.7},
+      {"column_pattern": ".*group.*", "confidence": 0.6}
+    ],
+    "project_patterns": [
+      {"column_pattern": ".*project.*", "confidence": 0.95},
+      {"column_pattern": ".*gcp.*project.*", "confidence": 0.95},
+      {"column_pattern": ".*aws.*account.*", "confidence": 0.9},
+      {"column_pattern": ".*azure.*subscription.*", "confidence": 0.9}
+    ]
   },
-  "storage": {
-    "streaming_enabled": false,
-    "kafka_brokers": [],
-    "elasticsearch_host": "",
-    "neo4j_uri": "",
-    "duckdb_path": "cmdb.db"
+  "output_database": "bigquery_cmdb.db",
+  "checkpoint": {
+    "enabled": true,
+    "checkpoint_dir": "checkpoints",
+    "checkpoint_interval": 1000
   },
-  "optimization": {
-    "mixed_precision": false,
-    "gradient_checkpointing": false,
-    "memory_fraction": 0.9,
-    "cache_size_gb": 8
+  "export": {
+    "csv": true,
+    "json": true,
+    "parquet": false,
+    "output_dir": "output"
   },
-  "sampling": {
-    "max_rows_per_table": 1000,
-    "column_sample_size": 100,
-    "confidence_threshold": 0.7
+  "logging": {
+    "level": "INFO",
+    "file": "logs/bigquery_cmdb.log",
+    "console": true,
+    "format": "detailed"
+  },
+  "performance": {
+    "max_workers": 4,
+    "batch_size": 100,
+    "enable_caching": true,
+    "cache_ttl_seconds": 3600
   }
 }
